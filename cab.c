@@ -43,6 +43,7 @@ struct cab_ctx_st {
 /* FILE_FORMAT method prototypes */
 static FILE_FORMAT_CTX *cab_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *outdata);
 static ASN1_OBJECT *cab_obsolete_link_get(u_char **p, int *plen, FILE_FORMAT_CTX *ctx);
+static int cab_hash_length_get(FILE_FORMAT_CTX *ctx);
 static int cab_check_file(FILE_FORMAT_CTX *ctx, int detached);
 static u_char *cab_digest_calc(FILE_FORMAT_CTX *ctx, const EVP_MD *md);
 static int cab_verify_digests(FILE_FORMAT_CTX *ctx, PKCS7 *p7);
@@ -57,6 +58,7 @@ static void cab_ctx_cleanup(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
 FILE_FORMAT file_format_cab = {
     .ctx_new = cab_ctx_new,
     .data_blob_get = cab_obsolete_link_get,
+    .hash_length_get = cab_hash_length_get,
     .check_file = cab_check_file,
     .digest_calc = cab_digest_calc,
     .verify_digests = cab_verify_digests,
@@ -147,6 +149,15 @@ static ASN1_OBJECT *cab_obsolete_link_get(u_char **p, int *plen, FILE_FORMAT_CTX
     dtype = OBJ_txt2obj(SPC_CAB_DATA_OBJID, 1);
     SpcLink_free(link);
     return dtype; /* OK */
+}
+
+/*
+ * [in] ctx: structure holds input and output data
+ * [returns] the size of the message digest when passed an EVP_MD structure (the size of the hash)
+ */
+static int cab_hash_length_get(FILE_FORMAT_CTX *ctx)
+{
+    return EVP_MD_size(ctx->options->md);
 }
 
 /*
@@ -274,7 +285,7 @@ static u_char *cab_digest_calc(FILE_FORMAT_CTX *ctx, const EVP_MD *md)
          * (u8 * cFolders) CFFOLDER - structure contains information about
          * one of the folders or partial folders stored in this cabinet file
          */
-        while (nfolders) {
+        while (nfolders && idx < fileend) {
             BIO_write(bhash, ctx->options->indata + idx, 8);
             idx += 8;
             nfolders--;
@@ -900,6 +911,7 @@ static int cab_add_header(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
      */
     nfolders = GET_UINT16_LE(ctx->options->indata + 26);
     while (nfolders) {
+        tmp = GET_UINT32_LE(ctx->options->indata + i);
         tmp += 24;
         PUT_UINT32_LE(tmp, buf);
         BIO_write(hash, buf, 4);

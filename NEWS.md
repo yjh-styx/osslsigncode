@@ -1,8 +1,23 @@
 # osslsigncode change log
 
-### 2.6 (unreleased)
+### 2.8 (unreleased)
 
-- get Certificate Revocation List from a CRL distribution point
+### 2.7 (2023.09.19)
+
+- fixed signing CAB files (by Michael Brown)
+- fixed handling of unsupported commands (by Maxim Bagryantsev)
+- fixed writing DIFAT sectors
+- added APPX support (by Maciej Panek and Małgorzata Olszówka)
+- added a built-in TSA response generation (-TSA-certs, -TSA-key
+  and -TSA-time options)
+
+### 2.6 (2023.05.29)
+
+- modular architecture implemented to simplify adding file formats
+- added verification of CRLs specified in the signing certificate
+- added MSI DIFAT sectors support (by Max Bagryantsev)
+- added legacy provider support for OpenSSL 3.0.0 and later
+- fixed numerous bugs
 
 ### 2.5 (2022.08.12)
 

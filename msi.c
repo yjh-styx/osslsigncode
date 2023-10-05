@@ -186,13 +186,16 @@ typedef struct {
     char *ministream;
     char *minifat;
     char *fat;
+    char *difat;
     uint32_t dirtreeLen;
     uint32_t miniStreamLen;
     uint32_t minifatLen;
     uint32_t fatLen;
+    uint32_t difatLen;
     uint32_t ministreamsMemallocCount;
     uint32_t minifatMemallocCount;
     uint32_t fatMemallocCount;
+    uint32_t difatMemallocCount;
     uint32_t dirtreeSectorsCount;
     uint32_t minifatSectorsCount;
     uint32_t fatSectorsCount;
@@ -212,6 +215,7 @@ struct msi_ctx_st {
 /* FILE_FORMAT method prototypes */
 static FILE_FORMAT_CTX *msi_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *outdata);
 static ASN1_OBJECT *msi_spc_sip_info_get(u_char **p, int *plen, FILE_FORMAT_CTX *ctx);
+static int msi_hash_length_get(FILE_FORMAT_CTX *ctx);
 static int msi_check_file(FILE_FORMAT_CTX *ctx, int detached);
 static u_char *msi_digest_calc(FILE_FORMAT_CTX *ctx, const EVP_MD *md);
 static int msi_verify_digests(FILE_FORMAT_CTX *ctx, PKCS7 *p7);
@@ -225,6 +229,7 @@ static void msi_ctx_cleanup(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
 FILE_FORMAT file_format_msi = {
     .ctx_new = msi_ctx_new,
     .data_blob_get = msi_spc_sip_info_get,
+    .hash_length_get = msi_hash_length_get,
     .check_file = msi_check_file,
     .digest_calc = msi_digest_calc,
     .verify_digests = msi_verify_digests,
@@ -341,6 +346,15 @@ static ASN1_OBJECT *msi_spc_sip_info_get(u_char **p, int *plen, FILE_FORMAT_CTX 
     dtype = OBJ_txt2obj(SPC_SIPINFO_OBJID, 1);
     SpcSipInfo_free(si);
     return dtype; /* OK */
+}
+
+/*
+ * [in] ctx: structure holds input and output data
+ * [returns] the size of the message digest when passed an EVP_MD structure (the size of the hash)
+ */
+static int msi_hash_length_get(FILE_FORMAT_CTX *ctx)
+{
+    return EVP_MD_size(ctx->options->md);
 }
 
 /*
@@ -1266,9 +1280,7 @@ static int msi_dirent_new(MSI_FILE *msi, MSI_ENTRY *entry, MSI_DIRENT *parent, M
     }
     /* detect cycles in previously visited entries (parents, siblings) */
     if (!ret) { /* initialized (non-root entry) */
-        if ((entry->leftSiblingID != NOSTREAM && tortoise->entry->leftSiblingID == entry->leftSiblingID)
-            || (entry->rightSiblingID != NOSTREAM && tortoise->entry->rightSiblingID == entry->rightSiblingID)
-            || (entry->childID != NOSTREAM && tortoise->entry->childID == entry->childID)) {
+        if (!memcmp(entry, tortoise->entry, sizeof(MSI_ENTRY))) {
             printf("MSI_ENTRY cycle detected at level %d\n", cnt);
             OPENSSL_free(entry);
             return 0; /* FAILED */
@@ -1540,6 +1552,16 @@ static void fat_append(MSI_OUT *out, char *buf, uint32_t len)
     }
     memcpy(out->fat + out->fatLen, buf, (size_t)len);
     out->fatLen += len;
+}
+
+static void difat_append(MSI_OUT *out, char *buf, uint32_t len)
+{
+    if (out->difatLen == (uint64_t)out->difatMemallocCount * out->sectorSize) {
+        out->difatMemallocCount += 1;
+        out->difat = OPENSSL_realloc(out->difat, (size_t)(out->difatMemallocCount * out->sectorSize));
+    }
+    memcpy(out->difat + out->difatLen, buf, (size_t)len);
+    out->difatLen += len;
 }
 
 static int msi_dirent_delete(MSI_DIRENT *dirent, const u_char *name, uint16_t nameLen)
@@ -1828,7 +1850,7 @@ static char *msi_dirent_get(MSI_ENTRY *entry)
     return data;
 }
 
-static char *msi_unused_dirent_get()
+static char *msi_unused_dirent_get(void)
 {
     char *data = OPENSSL_malloc(DIRENT_SIZE);
 
@@ -1938,24 +1960,13 @@ static void dirtree_save(MSI_DIRENT *dirent, BIO *outdata, MSI_OUT *out)
     out->sectorNum += out->dirtreeSectorsCount;
 }
 
-static void fat_pad_last_sector(MSI_OUT *out, int padValue, char *buf)
-{
-    if (out->fatLen % out->sectorSize > 0) {
-        uint32_t remain = out->sectorSize - out->fatLen % out->sectorSize;
-        memset(buf, padValue, (size_t)remain);
-        fat_append(out, buf, remain);
-    }
-}
-
 static int fat_save(BIO *outdata, MSI_OUT *out)
 {
     char buf[MAX_SECTOR_SIZE];
-    uint32_t i, j, remain, difatSectors, difatEntriesPerSector, fatSectorIndex, lastFatSectorIndex;
+    uint32_t i, j, remain, difatSectors, difatEntriesPerSector = 0, fatSectorIndex, lastFatSectorIndex;
 
     remain = (out->fatLen + out->sectorSize - 1) / out->sectorSize;
     out->fatSectorsCount = (out->fatLen + remain * 4 + out->sectorSize - 1) / out->sectorSize;
-
-    fat_pad_last_sector(out, 0, buf);
 
     if (out->fatSectorsCount > DIFAT_IN_HEADER) {
         difatEntriesPerSector = (out->sectorSize / 4) - 1;
@@ -2001,7 +2012,7 @@ static int fat_save(BIO *outdata, MSI_OUT *out)
                 PUT_UINT32_LE(out->sectorNum + 1, buf + out->sectorSize - 4);
             }
 
-            fat_append(out, buf, out->sectorSize);
+            difat_append(out, buf, out->sectorSize);
             out->sectorNum++;
         }
     }
@@ -2019,9 +2030,14 @@ static int fat_save(BIO *outdata, MSI_OUT *out)
     }
 
     /* empty unallocated free sectors in the last FAT sector */
-    fat_pad_last_sector(out, (int)FREESECT, buf);
+    if (out->fatLen % out->sectorSize > 0) {
+        remain = out->sectorSize - out->fatLen % out->sectorSize;
+        memset(buf, (int)FREESECT, (size_t)remain);
+        fat_append(out, buf, remain);
+    }
 
     BIO_write(outdata, out->fat, (int)out->fatLen);
+    BIO_write(outdata, out->difat, (int)out->difatLen);
     return 1; /* OK */
 }
 

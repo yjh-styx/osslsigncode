@@ -11,12 +11,10 @@
 /* Prototypes */
 static int pkcs7_set_content_blob(PKCS7 *sig, PKCS7 *cursig);
 static SpcSpOpusInfo *spc_sp_opus_info_create(FILE_FORMAT_CTX *ctx);
-static int X509_attribute_chain_append_signature(STACK_OF(X509_ATTRIBUTE) **unauth_attr, u_char *p, int len);
 static int spc_indirect_data_content_get(u_char **blob, int *len, FILE_FORMAT_CTX *ctx);
-static int pkcs7_set_spc_indirect_data_content(PKCS7 *p7, BIO *hash, u_char *buf, int len);
+static int pkcs7_set_spc_indirect_data_content(PKCS7 *p7, BIO *hash, u_char *buf, int len, FILE_FORMAT_CTX *ctx);
 static int pkcs7_signer_info_add_spc_sp_opus_info(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx);
 static int pkcs7_signer_info_add_purpose(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx);
-static int pkcs7_signer_info_add_signing_time(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx);
 
 /*
  * Common functions
@@ -174,7 +172,7 @@ static int pkcs7_signer_info_add_purpose(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX 
  * [in] ctx: structure holds input and output data
  * [returns] 0 on error or 1 on success
  */
-static int pkcs7_signer_info_add_signing_time(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx)
+int pkcs7_signer_info_add_signing_time(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx)
 {
     if (ctx->options->time == INVALID_TIME) /* -time option was not specified */
         return 1; /* SUCCESS */
@@ -300,6 +298,7 @@ PKCS7 *pkcs7_create(FILE_FORMAT_CTX *ctx)
 /*
  * [in, out] p7: new PKCS#7 signature
  * [in] hash: message digest BIO
+ * [in] ctx: structure holds input and output data
  * [returns] 0 on error or 1 on success
  */
 int add_indirect_data_object(PKCS7 *p7, BIO *hash, FILE_FORMAT_CTX *ctx)
@@ -377,44 +376,6 @@ static int pkcs7_set_content_blob(PKCS7 *sig, PKCS7 *cursig)
         printf("PKCS7_set_content failed\n");
         return 0; /* FAILED */
     }
-    return 1; /* OK */
-}
-
-/*
- * Add the new signature to the current signature as a nested signature:
- * new unauthorized SPC_NESTED_SIGNATURE_OBJID attribute
- * [out] cursig: current PKCS#7 signature
- * [in] p7: new PKCS#7 signature
- * [in] ctx: structure holds input and output data
- * [returns] 0 on error or 1 on success
- */
-int cursig_set_nested(PKCS7 *cursig, PKCS7 *p7, FILE_FORMAT_CTX *ctx)
-{
-    u_char *p = NULL;
-    int len = 0;
-    PKCS7_SIGNER_INFO *si;
-    STACK_OF(PKCS7_SIGNER_INFO) *signer_info;
-
-    if (!cursig)
-        return 0; /* FAILED */
-    signer_info = PKCS7_get_signer_info(cursig);
-    if (!signer_info)
-        return 0; /* FAILED */
-    si = sk_PKCS7_SIGNER_INFO_value(signer_info, 0);
-    if (!si)
-        return 0; /* FAILED */
-    if (((len = i2d_PKCS7(p7, NULL)) <= 0) ||
-        (p = OPENSSL_malloc((size_t)len)) == NULL)
-        return 0; /* FAILED */
-    i2d_PKCS7(p7, &p);
-    p -= len;
-
-    pkcs7_signer_info_add_signing_time(si, ctx);
-    if (!X509_attribute_chain_append_signature(&(si->unauth_attr), p, len)) {
-        OPENSSL_free(p);
-        return 0; /* FAILED */
-    }
-    OPENSSL_free(p);
     return 1; /* OK */
 }
 
@@ -511,7 +472,7 @@ int pkcs7_set_data_content(PKCS7 *p7, BIO *hash, FILE_FORMAT_CTX *ctx)
     buf = OPENSSL_malloc(SIZE_64K);
     memcpy(buf, p, (size_t)len);
     OPENSSL_free(p);
-    if (!pkcs7_set_spc_indirect_data_content(p7, hash, buf, len)) {
+    if (!pkcs7_set_spc_indirect_data_content(p7, hash, buf, len, ctx)) {
         OPENSSL_free(buf);
         return 0; /* FAILED */
     }
@@ -604,44 +565,6 @@ static SpcSpOpusInfo *spc_sp_opus_info_create(FILE_FORMAT_CTX *ctx)
 }
 
 /*
- * [in, out] unauth_attr: unauthorized attributes list
- * [in] p: PKCS#7 data
- * [in] len: PKCS#7 data length
- * [returns] 0 on error or 1 on success
- */
-static int X509_attribute_chain_append_signature(STACK_OF(X509_ATTRIBUTE) **unauth_attr, u_char *p, int len)
-{
-    X509_ATTRIBUTE *attr = NULL;
-    int nid = OBJ_txt2nid(SPC_NESTED_SIGNATURE_OBJID);
-
-    if (*unauth_attr == NULL) {
-        if ((*unauth_attr = sk_X509_ATTRIBUTE_new_null()) == NULL)
-            return 0; /* FAILED */
-    } else {
-        /* try to find SPC_NESTED_SIGNATURE_OBJID attribute */
-        int i;
-        for (i = 0; i < sk_X509_ATTRIBUTE_num(*unauth_attr); i++) {
-            attr = sk_X509_ATTRIBUTE_value(*unauth_attr, i);
-            if (OBJ_obj2nid(X509_ATTRIBUTE_get0_object(attr)) == nid) {
-                /* append p to the V_ASN1_SEQUENCE */
-                if (!X509_ATTRIBUTE_set1_data(attr, V_ASN1_SEQUENCE, p, len))
-                    return 0; /* FAILED */
-                return 1; /* OK */
-            }
-        }
-    }
-    /* create new unauthorized SPC_NESTED_SIGNATURE_OBJID attribute */
-    attr = X509_ATTRIBUTE_create_by_NID(NULL, nid, V_ASN1_SEQUENCE, p, len);
-    if (!attr)
-        return 0; /* FAILED */
-    if (!sk_X509_ATTRIBUTE_push(*unauth_attr, attr)) {
-        X509_ATTRIBUTE_free(attr);
-        return 0; /* FAILED */
-    }
-    return 1; /* OK */
-}
-
-/*
  * [out] blob: SpcIndirectDataContent data
  * [out] len: SpcIndirectDataContent data length
  * [in] ctx: FILE_FORMAT_CTX structure
@@ -651,6 +574,7 @@ static int spc_indirect_data_content_get(u_char **blob, int *len, FILE_FORMAT_CT
 {
     u_char *p = NULL;
     int hashlen, l = 0;
+    int mdtype = EVP_MD_nid(ctx->options->md);
     void *hash;
     SpcIndirectDataContent *idc = SpcIndirectDataContent_new();
 
@@ -660,13 +584,12 @@ static int spc_indirect_data_content_get(u_char **blob, int *len, FILE_FORMAT_CT
     idc->data->type = ctx->format->data_blob_get(&p, &l, ctx);
     idc->data->value->value.sequence->data = p;
     idc->data->value->value.sequence->length = l;
-    idc->messageDigest->digestAlgorithm->algorithm = OBJ_nid2obj(EVP_MD_nid(ctx->options->md));
+    idc->messageDigest->digestAlgorithm->algorithm = OBJ_nid2obj(mdtype);
     idc->messageDigest->digestAlgorithm->parameters = ASN1_TYPE_new();
     idc->messageDigest->digestAlgorithm->parameters->type = V_ASN1_NULL;
 
-    hashlen = EVP_MD_size(ctx->options->md);
-    hash = OPENSSL_malloc((size_t)hashlen);
-    memset(hash, 0, (size_t)hashlen);
+    hashlen = ctx->format->hash_length_get(ctx);
+    hash = OPENSSL_zalloc((size_t)hashlen);
     ASN1_OCTET_STRING_set(idc->messageDigest->digest, hash, hashlen);
     OPENSSL_free(hash);
 
@@ -675,7 +598,7 @@ static int spc_indirect_data_content_get(u_char **blob, int *len, FILE_FORMAT_CT
     p = *blob;
     i2d_SpcIndirectDataContent(idc, &p);
     SpcIndirectDataContent_free(idc);
-    *len -= EVP_MD_size(ctx->options->md);
+    *len -= hashlen;
     return 1; /* OK */
 }
 
@@ -685,17 +608,24 @@ static int spc_indirect_data_content_get(u_char **blob, int *len, FILE_FORMAT_CT
  * [in] hash: message digest BIO
  * [in] blob: SpcIndirectDataContent data
  * [in] len: SpcIndirectDataContent data length
+ * [in] ctx: FILE_FORMAT_CTX structure
  * [returns] 0 on error or 1 on success
  */
-static int pkcs7_set_spc_indirect_data_content(PKCS7 *p7, BIO *hash, u_char *buf, int len)
+static int pkcs7_set_spc_indirect_data_content(PKCS7 *p7, BIO *hash, u_char *buf, int len, FILE_FORMAT_CTX *ctx)
 {
-    u_char mdbuf[EVP_MAX_MD_SIZE];
-    int mdlen, seqhdrlen;
+    u_char mdbuf[5 * EVP_MAX_MD_SIZE + 24];
+    int mdlen, seqhdrlen, hashlen;
     BIO *bio;
     PKCS7 *td7;
 
-    mdlen = BIO_gets(hash, (char*)mdbuf, EVP_MAX_MD_SIZE);
-    memcpy(buf+len, mdbuf, (size_t)mdlen);
+    hashlen = ctx->format->hash_length_get(ctx);
+    if (hashlen > EVP_MAX_MD_SIZE) {
+        /* APPX format specific */
+        mdlen = BIO_read(hash, (char*)mdbuf, hashlen);
+    } else {
+        mdlen = BIO_gets(hash, (char*)mdbuf, EVP_MAX_MD_SIZE);
+    }
+    memcpy(buf + len, mdbuf, (size_t)mdlen);
     seqhdrlen = asn1_simple_hdr_len(buf, len);
 
     if ((bio = PKCS7_dataInit(p7, NULL)) == NULL) {
@@ -716,7 +646,7 @@ static int pkcs7_set_spc_indirect_data_content(PKCS7 *p7, BIO *hash, u_char *buf
     td7->d.other = ASN1_TYPE_new();
     td7->d.other->type = V_ASN1_SEQUENCE;
     td7->d.other->value.sequence = ASN1_STRING_new();
-    ASN1_STRING_set(td7->d.other->value.sequence, buf, len+mdlen);
+    ASN1_STRING_set(td7->d.other->value.sequence, buf, len + mdlen);
     if (!PKCS7_set_content(p7, td7)) {
         PKCS7_free(td7);
         printf("PKCS7_set_content failed\n");

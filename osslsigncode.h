@@ -60,7 +60,9 @@
 #if OPENSSL_VERSION_NUMBER>=0x30000000L
 #include <openssl/provider.h>
 #endif /* OPENSSL_VERSION_NUMBER>=0x30000000L */
+#include <openssl/rand.h>
 #include <openssl/safestack.h>
+#include <openssl/ts.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h> /* X509_PURPOSE */
 
@@ -210,6 +212,9 @@
 #define DO_EXIT_1(x, y) { printf(x, y); goto err_cleanup; }
 #define DO_EXIT_2(x, y, z) { printf(x, y, z); goto err_cleanup; }
 
+/* Default policy if request did not specify it. */
+#define TSA_POLICY1 "1.2.3.4.1"
+
 typedef enum {
     CMD_SIGN,
     CMD_EXTRACT,
@@ -278,6 +283,9 @@ typedef struct {
     cmd_type_t cmd;
     char *indata;
     PKCS7 *prevsig;
+    char *tsa_certfile;
+    char *tsa_keyfile;
+    time_t tsa_time;
 } GLOBAL_OPTIONS;
 
 /*
@@ -458,6 +466,7 @@ typedef struct msi_ctx_st MSI_CTX;
 typedef struct pe_ctx_st PE_CTX;
 typedef struct cab_ctx_st CAB_CTX;
 typedef struct cat_ctx_st CAT_CTX;
+typedef struct appx_ctx_st APPX_CTX;
 
 typedef struct {
     FILE_FORMAT *format;
@@ -467,6 +476,7 @@ typedef struct {
         PE_CTX *pe_ctx;
         CAB_CTX *cab_ctx;
         CAT_CTX *cat_ctx;
+        APPX_CTX *appx_ctx;
     };
 } FILE_FORMAT_CTX;
 
@@ -474,10 +484,12 @@ extern FILE_FORMAT file_format_msi;
 extern FILE_FORMAT file_format_pe;
 extern FILE_FORMAT file_format_cab;
 extern FILE_FORMAT file_format_cat;
+extern FILE_FORMAT file_format_appx;
 
 struct file_format_st {
     FILE_FORMAT_CTX *(*ctx_new) (GLOBAL_OPTIONS *option, BIO *hash, BIO *outdata);
     ASN1_OBJECT *(*data_blob_get) (u_char **p, int *plen, FILE_FORMAT_CTX *ctx);
+    int (*hash_length_get) (FILE_FORMAT_CTX *ctx);
     int (*check_file) (FILE_FORMAT_CTX *ctx, int detached);
     u_char *(*digest_calc) (FILE_FORMAT_CTX *ctx, const EVP_MD *md);
     int (*verify_digests) (FILE_FORMAT_CTX *ctx, PKCS7 *p7);
