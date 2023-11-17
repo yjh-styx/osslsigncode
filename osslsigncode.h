@@ -21,6 +21,7 @@
 #endif /* HAVE_CONFIG_H */
 
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -81,12 +82,12 @@
 #define PROVIDE_ASKPASS 1
 #endif
 
-#ifdef _WIN32
-#define FILE_CREATE_MODE "w+b"
-#else
-#define FILE_CREATE_MODE "w+bx"
-#endif
 
+#ifdef WIN32
+#define remove_file(filename) _unlink(filename)
+#else
+#define remove_file(filename) unlink(filename)
+#endif /* WIN32 */
 
 #define GET_UINT8_LE(p) ((const u_char *)(p))[0]
 

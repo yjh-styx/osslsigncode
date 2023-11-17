@@ -1173,14 +1173,14 @@ static void print_cert(X509 *cert, int i)
     issuer = X509_NAME_oneline(X509_get_issuer_name(cert), NULL, 0);
     serialbn = ASN1_INTEGER_to_BN(X509_get_serialNumber(cert), NULL);
     serial = BN_bn2hex(serialbn);
-    if (i > 0)
-        printf("\t------------------\n");
+    printf("\t------------------\n");
     printf("\tSigner #%d:\n\t\tSubject: %s\n\t\tIssuer : %s\n\t\tSerial : %s\n\t\tCertificate expiration date:\n",
             i, subject, issuer, serial);
     printf("\t\t\tnotBefore : ");
     print_asn1_time(X509_get0_notBefore(cert));
     printf("\t\t\tnotAfter : ");
     print_asn1_time(X509_get0_notAfter(cert));
+    printf("\n");
 
     OPENSSL_free(subject);
     OPENSSL_free(issuer);
@@ -1189,24 +1189,106 @@ static void print_cert(X509 *cert, int i)
 }
 
 /*
- * Print X509 certificate list from p7->d.sign->cert
- * [in] p7: PKCS#7 signature
- * [returns] 1 on success
+ * [in] txt, list
+ * [returns] 0 on error or 1 on success
  */
-static int print_certs(PKCS7 *p7)
+static int on_list(const char *txt, const char *list[])
 {
-    X509 *cert;
-    int i, count;
+    while (*list)
+        if (!strcmp(txt, *list++))
+            return 1; /* OK */
+    return 0; /* FAILED */
+}
 
-    count = sk_X509_num(p7->d.sign->cert);
-    printf("\nNumber of certificates: %d\n", count);
-    for (i=0; i<count; i++) {
-        cert = sk_X509_value(p7->d.sign->cert, i);
-        if (!cert)
-            return 0; /* FAILED */
-        print_cert(cert, i);
+/*
+ * Check Windows certificate whitelist:
+ * https://learn.microsoft.com/en-us/troubleshoot/windows-server/identity/trusted-root-certificates-are-required
+ * For Microsoft Root Authority, serial number: 00C1008B3C3C8811D13EF663ECDF40,
+ * fingerprint: "F3:84:06:E5:40:D7:A9:D9:0C:B4:A9:47:92:99:64:0F:FB:6D:F9:E2:24:EC:C7:A0:1C:0D:95:58:D8:DA:D7:7D"
+ * expiration date: 12/31/2020, intended purposes: All,
+ * ignore X509_V_ERR_INVALID_CA and X509_V_ERR_CERT_HAS_EXPIRED
+ * [in] cert: X509 certificate
+ * [in] error: error code
+ * [returns] 0 on error or 1 on success
+ */
+static int trusted_cert(X509 *cert, int error) {
+    const char *fingerprints[] = {
+        "F3:84:06:E5:40:D7:A9:D9:0C:B4:A9:47:92:99:64:0F:FB:6D:F9:E2:24:EC:C7:A0:1C:0D:95:58:D8:DA:D7:7D",
+        NULL
+    };
+    u_char mdbuf[EVP_MAX_MD_SIZE], *p;
+    char *hex = NULL;
+    int len;
+    const EVP_MD *md = EVP_get_digestbynid(NID_sha256);
+    BIO *bhash = BIO_new(BIO_f_md());
+
+    if (!BIO_set_md(bhash, md)) {
+        BIO_free_all(bhash);
+        return 0; /* FAILED */
     }
-    return 1; /* OK */
+    BIO_push(bhash, BIO_new(BIO_s_null()));
+    len = i2d_X509(cert, NULL);
+    p = OPENSSL_malloc((size_t)len);
+    i2d_X509(cert, &p);
+    p -= len;
+    BIO_write(bhash, p, len);
+    OPENSSL_free(p);
+    BIO_gets(bhash, (char *)mdbuf, EVP_MD_size(md));
+    BIO_free_all(bhash);
+
+    hex = OPENSSL_buf2hexstr(mdbuf, (long)EVP_MD_size(md));
+    if (!hex) {
+        return 0; /* FAILED */
+    }
+    if (on_list(hex, fingerprints)) {
+        printf("\tWarning: Ignoring %s error for Windows certificate whitelist\n",
+            X509_verify_cert_error_string(error));
+        OPENSSL_free(hex);
+        return 1; /* trusted */
+    }
+    OPENSSL_free(hex);
+    return 0; /* untrusted */
+}
+
+/*
+ * X509_STORE_CTX_verify_cb
+ */
+static int verify_ca_callback(int ok, X509_STORE_CTX *ctx)
+{
+    int error = X509_STORE_CTX_get_error(ctx);
+    int depth = X509_STORE_CTX_get_error_depth(ctx);
+
+    X509 *current_cert = X509_STORE_CTX_get_current_cert(ctx);
+    print_cert(current_cert, depth);
+    if (!ok) {
+        if (trusted_cert(current_cert, error)) {
+            return 1;
+        } else {
+            printf("\tError: %s\n", X509_verify_cert_error_string(error));
+        }
+    }
+    return ok;
+}
+
+static int verify_crl_callback(int ok, X509_STORE_CTX *ctx)
+{
+    int error = X509_STORE_CTX_get_error(ctx);
+    int depth = X509_STORE_CTX_get_error_depth(ctx);
+
+    X509 *current_cert = X509_STORE_CTX_get_current_cert(ctx);
+    print_cert(current_cert, depth);
+    if (!ok) {
+        if (trusted_cert(current_cert, error)) {
+            return 1;
+        } else if (error == X509_V_ERR_CERT_HAS_EXPIRED) {
+            printf("\tWarning: Ignoring %s error for CRL validation\n",
+                X509_verify_cert_error_string(error));
+            return 1;
+        } else {
+            printf("\tError: %s\n", X509_verify_cert_error_string(error));
+        }
+    }
+    return ok;
 }
 
 /*
@@ -1233,28 +1315,9 @@ static int x509_store_load_file(X509_STORE *store, char *cafile)
         return 0; /* FAILED */
     if (!X509_STORE_set1_param(store, param))
         return 0; /* FAILED */
+    X509_STORE_set_verify_cb(store, verify_ca_callback);
 
     return 1; /* OK */
-}
-
-/* X509_STORE_CTX_verify_cb */
-static int verify_callback(int ok, X509_STORE_CTX *ctx)
-{
-    int error = X509_STORE_CTX_get_error(ctx);
-    int depth = X509_STORE_CTX_get_error_depth(ctx);
-
-    if (!ok && error == X509_V_ERR_CERT_HAS_EXPIRED) {
-        if (depth == 0) {
-            printf("\nWarning: Ignoring expired signer certificate for CRL validation\n");
-            return 1;
-        } else {
-            X509 *current_cert = X509_STORE_CTX_get_current_cert(ctx);
-            printf("\nError: Expired CA certificate:\n");
-            print_cert(current_cert, 0);
-            printf("\n");
-        }
-    }
-    return ok;
 }
 
 /*
@@ -1287,7 +1350,7 @@ static int x509_store_load_crlfile(X509_STORE *store, char *cafile, char *crlfil
         return 0; /* FAILED */
     if (!X509_STORE_set1_param(store, param))
         return 0; /* FAILED */
-    X509_STORE_set_verify_cb(store, verify_callback);
+    X509_STORE_set_verify_cb(store, verify_crl_callback);
 
     return 1; /* OK */
 }
@@ -1326,6 +1389,7 @@ static int verify_crl(char *cafile, char *crlfile, STACK_OF(X509_CRL) *crls,
     if (crls)
         X509_STORE_CTX_set0_crls(ctx, crls);
 
+    printf("\nCertificate Revocation List verified by:\n");
     if (X509_verify_cert(ctx) <= 0) {
         int error = X509_STORE_CTX_get_error(ctx);
         printf("\nX509_verify_cert: certificate verify error: %s\n",
@@ -1567,6 +1631,7 @@ static int verify_timestamp(FILE_FORMAT_CTX *ctx, PKCS7 *p7, CMS_ContentInfo *ti
     }
 
     /* verify a CMS SignedData structure */
+    printf("\nTimestamp verified by:\n");
     if (!CMS_verify(timestamp, NULL, store, 0, NULL, 0)) {
         printf("\nCMS_verify error\n");
         X509_STORE_free(store);
@@ -1680,6 +1745,14 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
         bio = BIO_new_mem_buf(p7->d.sign->contents->d.other->value.sequence->data,
             p7->d.sign->contents->d.other->value.sequence->length);
     }
+    printf("Signing Certificate Chain:\n");
+    /*
+     * In the PKCS7_verify() function, the BIO *indata parameter refers to
+     * the signed data if the content is detached from p7.
+     * Otherwise, indata should be NULL, and then the signed data must be in p7.
+     * The OpenSSL error workaround is to put the inner content into BIO *indata parameter
+     * https://github.com/openssl/openssl/pull/22575
+     */
     if (!PKCS7_verify(p7, NULL, store, bio, NULL, 0)) {
         printf("\nPKCS7_verify error\n");
         X509_STORE_free(store);
@@ -1812,6 +1885,7 @@ static int print_cms_timestamp(CMS_ContentInfo *timestamp, time_t time)
 {
     STACK_OF(CMS_SignerInfo) *sinfos;
     CMS_SignerInfo *si;
+    X509_ATTRIBUTE *attr;
     int md_nid;
     ASN1_INTEGER *serialno;
     char *issuer_name, *serial;
@@ -1825,19 +1899,28 @@ static int print_cms_timestamp(CMS_ContentInfo *timestamp, time_t time)
     si = sk_CMS_SignerInfo_value(sinfos, 0);
     if (si == NULL)
         return 0; /* FAILED */
-    printf("\nThe signature is timestamped: ");
+    printf("\nCountersignatures:\n\tTimestamp time: ");
     print_time_t(time);
+
+    /* PKCS#9 signing time - Policy OID: 1.2.840.113549.1.9.5 */
+    attr = CMS_signed_get_attr(si, CMS_signed_get_attr_by_NID(si, NID_pkcs9_signingTime, -1));
+    if (attr == NULL)
+        return 0; /* FAILED */
+    printf("\tSigning time: ");
+    print_time_t(time_t_get_asn1_time(X509_ATTRIBUTE_get0_data(attr, 0, V_ASN1_UTCTIME, NULL)));
+
     CMS_SignerInfo_get0_algs(si, NULL, NULL, &pdig, NULL);
     if (pdig == NULL || pdig->algorithm == NULL)
         return 0; /* FAILED */
     md_nid = OBJ_obj2nid(pdig->algorithm);
-    printf("Hash Algorithm: %s\n", (md_nid == NID_undef) ? "UNKNOWN" : OBJ_nid2ln(md_nid));
+    printf("\tHash Algorithm: %s\n", (md_nid == NID_undef) ? "UNKNOWN" : OBJ_nid2ln(md_nid));
+
     if (!CMS_SignerInfo_get0_signer_id(si, NULL, &issuer, &serialno) || !issuer)
         return 0; /* FAILED */
     issuer_name = X509_NAME_oneline(issuer, NULL, 0);
     serialbn = ASN1_INTEGER_to_BN(serialno, NULL);
     serial = BN_bn2hex(serialbn);
-    printf("Timestamp Verified by:\n\t\tIssuer : %s\n\t\tSerial : %s\n", issuer_name, serial);
+    printf("\tIssuer: %s\n\tSerial: %s\n", issuer_name, serial);
     OPENSSL_free(issuer_name);
     BN_free(serialbn);
     OPENSSL_free(serial);
@@ -1871,7 +1954,7 @@ static time_t time_t_timestamp_get_attributes(CMS_ContentInfo **timestamp, PKCS7
     if (!si)
         return INVALID_TIME; /* FAILED */
     md_nid = OBJ_obj2nid(si->digest_alg->algorithm);
-    printf("\nMessage digest algorithm: %s\n",
+    printf("Message digest algorithm: %s\n",
         (md_nid == NID_undef) ? "UNKNOWN" : OBJ_nid2sn(md_nid));
     printf("\nAuthenticated attributes:\n");
     auth_attr = PKCS7_get_signed_attributes(si);  /* cont[0] */
@@ -2228,21 +2311,25 @@ static int verify_member(FILE_FORMAT_CTX *ctx, CatalogAuthAttr *attribute)
     ASN1_TYPE_free(content);
     if (mdtype == -1) {
         printf("Failed to extract current message digest\n\n");
+        SpcIndirectDataContent_free(idc);
         return 1; /* FAILED */
     }
     if (!ctx->format->digest_calc) {
         printf("Unsupported method: digest_calc\n");
+        SpcIndirectDataContent_free(idc);
         return 1; /* FAILED */
     }
     md = EVP_get_digestbynid(mdtype);
     cmdbuf = ctx->format->digest_calc(ctx, md);
     if (!cmdbuf) {
         printf("Failed to compute a message digest value\n\n");
-        return 1; /* Failed */
+        SpcIndirectDataContent_free(idc);
+        return 1; /* FAILED */
     }
     mdlen = EVP_MD_size(EVP_get_digestbynid(mdtype));
     if (memcmp(mdbuf, cmdbuf, (size_t)mdlen)) {
         OPENSSL_free(cmdbuf);
+        SpcIndirectDataContent_free(idc);
         return 1; /* FAILED */
     } else {
         printf("Message digest algorithm  : %s\n", OBJ_nid2sn(mdtype));
@@ -2336,8 +2423,6 @@ static int verify_signature(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
     printf("Signer's certificate:\n");
     print_cert(signer, 0);
 
-    if (!print_certs(p7))
-        printf("Print certs error\n");
     time = time_t_timestamp_get_attributes(&timestamp, p7, ctx->options->verbose);
     if (ctx->options->leafhash != NULL) {
         leafok = verify_leaf_hash(signer, ctx->options->leafhash);
@@ -2358,7 +2443,7 @@ static int verify_signature(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
         printf("TSA's CRL file: %s\n", ctx->options->tsa_crlfile);
     if (timestamp) {
         if (ctx->options->ignore_timestamp) {
-            printf("\nTimestamp Server Signature verification is disabled\n\n");
+            printf("\nTimestamp Server Signature verification is disabled\n");
             time = INVALID_TIME;
         } else {
             int timeok = verify_timestamp(ctx, p7, timestamp, time);
@@ -2509,8 +2594,8 @@ static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
                 printf("Catalog verification: failed\n\n");
             }
         } else if (ctx->format->verify_digests) {
+            printf("\nSignature Index: %d %s\n\n", i, i==0 ? " (Primary Signature)" : "");
             if (ctx->format->verify_digests(ctx, sig)) {
-                printf("Signature Index: %d %s\n", i, i==0 ? " (Primary Signature)" : "");
                 ret &= verify_signature(ctx, sig);
             }
         } else {
@@ -2618,19 +2703,6 @@ static void free_options(GLOBAL_OPTIONS *options)
     options->xcerts = NULL;
     sk_X509_CRL_pop_free(options->crls, X509_CRL_free);
     options->crls = NULL;
-}
-
-
-/*
- * [in] txt, list
- * [returns] 0 on error or 1 on success
- */
-static int on_list(const char *txt, const char *list[])
-{
-    while (*list)
-        if (!strcmp(txt, *list++))
-            return 1; /* OK */
-    return 0; /* FAILED */
 }
 
 /*
@@ -3579,6 +3651,18 @@ static int use_legacy(void)
 }
 #endif /* OPENSSL_VERSION_NUMBER>=0x30000000L */
 
+static int file_exists(const char *filename)
+{
+    if (filename) {
+        FILE *file = fopen(filename, "rb");
+        if (file) {
+            fclose(file);
+            return 1; /* File exists */
+        }
+    }
+    return 0; /* File does not exist */
+}
+
 /*
  * [in] argc, argv
  * [in, out] options: structure holds the input data
@@ -3909,6 +3993,10 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
             argc--;
         }
     }
+    if (cmd != CMD_VERIFY && file_exists(options->outfile)) {
+        printf("Overwriting an existing file is not supported.\n");
+        return 0; /* FAILED */
+    }
     if (argc > 0 ||
 #ifdef ENABLE_CURL
         (options->nturl && options->ntsurl) ||
@@ -3985,8 +4073,10 @@ int main(int argc, char **argv)
             DO_EXIT_0("Unable to set the message digest of BIO\n");
         }
         /* Create outdata file */
-        outdata = BIO_new_file(options.outfile, FILE_CREATE_MODE);
-        if (outdata == NULL) {
+        outdata = BIO_new_file(options.outfile, "w+bx");
+        if (!outdata && errno != EEXIST)
+            outdata = BIO_new_file(options.outfile, "w+b");
+        if (!outdata) {
             BIO_free_all(hash);
             DO_EXIT_1("Failed to create file: %s\n", options.outfile);
         }
@@ -4001,9 +4091,13 @@ int main(int argc, char **argv)
     if (!ctx)
         ctx = file_format_cat.ctx_new(&options, hash, outdata);
     if (!ctx) {
-        ret = 1; /* FAILED */
+        if (outdata && options.outfile) {
+            /* unlink outfile */
+            remove_file(options.outfile);
+        }
         BIO_free_all(hash);
         BIO_free_all(outdata);
+        ret = 1; /* FAILED */
         DO_EXIT_0("Initialization error or unsupported input file type.\n");
     }
     if (options.cmd == CMD_VERIFY) {
@@ -4077,6 +4171,10 @@ skip_signing:
     }
 
 err_cleanup:
+    if (outdata && options.outfile) {
+        /* unlink outfile */
+        remove_file(options.outfile);
+    }
     if (ctx && ctx->format->ctx_cleanup) {
         ctx->format->ctx_cleanup(ctx, hash, outdata);
     }

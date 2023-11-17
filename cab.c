@@ -498,9 +498,13 @@ static PKCS7 *cab_pkcs7_prepare(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
             PKCS7_free(p7);
             return NULL; /* FAILED */
         }
-        if (!add_indirect_data_object(p7, hash, ctx)) {
+        if (!add_indirect_data_object(p7)) {
             printf("Adding SPC_INDIRECT_DATA_OBJID failed\n");
             PKCS7_free(p7);
+            return NULL; /* FAILED */
+        }
+        if (!sign_spc_indirect_data_content(p7, hash, ctx)) {
+            printf("Failed to set signed content\n");
             return NULL; /* FAILED */
         }
     }
@@ -591,7 +595,7 @@ static BIO *cab_bio_free(BIO *hash, BIO *outdata)
 
 /*
  * Deallocate a FILE_FORMAT_CTX structure and CAB format specific structure,
- * unmap indata file, unlink outfile.
+ * unmap indata file.
  * [in, out] ctx: structure holds input and output data
  * [out] hash: message digest BIO
  * [in] outdata: outdata file BIO
@@ -601,13 +605,6 @@ static void cab_ctx_cleanup(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
 {
     if (outdata) {
         BIO_free_all(hash);
-        if (ctx->options->outfile) {
-#ifdef WIN32
-            _unlink(ctx->options->outfile);
-#else
-            unlink(ctx->options->outfile);
-#endif /* WIN32 */
-        }
     }
     unmap_file(ctx->options->indata, ctx->cab_ctx->fileend);
     OPENSSL_free(ctx->cab_ctx);
