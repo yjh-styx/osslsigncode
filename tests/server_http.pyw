@@ -41,8 +41,9 @@ class RequestHandler(SimpleHTTPRequestHandler):
         try:
             url = urlparse(self.path)
             self.send_response(200)
-            self.send_header("Content-type", "application/crl")
+            self.send_header("Content-type", "application/pkix-crl")
             self.end_headers()
+            resp_data = b''
             # Read the file and send the contents
             if url.path == "/intermediateCA":
                 with open(CACRL, 'rb') as file:
@@ -52,7 +53,8 @@ class RequestHandler(SimpleHTTPRequestHandler):
                     resp_data = file.read()
             self.wfile.write(resp_data)
         except Exception as err: # pylint: disable=broad-except
-            print(f"HTTP GET request error: {err}")
+            print("HTTP GET request error: {}".format(err))
+
 
     def do_POST(self): # pylint: disable=invalid-name
         """"Serves the POST request type"""
@@ -76,12 +78,12 @@ class RequestHandler(SimpleHTTPRequestHandler):
                 openssl.check_returncode()
                 self.send_header("Content-type", "application/timestamp-reply")
                 self.end_headers()
-                resp_data = None
+                resp_data = b''
                 with open(RESPONS, mode="rb") as file:
                     resp_data = file.read()
                 self.wfile.write(resp_data)
         except Exception as err: # pylint: disable=broad-except
-            print(f"HTTP POST request error: {err}")
+            print("HTTP POST request error: {}".format(err))
 
 
 class HttpServerThread():
@@ -93,12 +95,12 @@ class HttpServerThread():
         self.server_thread = None
 
     def start_server(self) -> (int):
-        """Starting HTTP server on localhost and a random available port for binding"""
-        self.server = ThreadingHTTPServer(('localhost', 19254), RequestHandler)
+        """Starting HTTP server on 127.0.0.1 and a random available port for binding"""
+        self.server = ThreadingHTTPServer(('127.0.0.1', 19254), RequestHandler)
         self.server_thread = threading.Thread(target=self.server.serve_forever)
         self.server_thread.start()
         hostname, port = self.server.server_address[:2]
-        print(f"HTTP server started, URL http://{hostname}:{port}")
+        print("HTTP server started, URL http://{}:{}".format(hostname, port))
         return port
 
 
@@ -113,7 +115,7 @@ def main() -> None:
         with open(PORT_LOG, mode="w") as file:
             file.write("{}".format(port))
     except OSError as err:
-        print(f"OSError: {err}")
+        print("OSError: {}".format(err))
         ret = err.errno
     finally:
         sys.exit(ret)

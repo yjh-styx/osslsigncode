@@ -6,6 +6,7 @@
  * Copyright (C) 2023 Michał Trojnara <Michal.Trojnara@stunnel.org>
  * Author: Małgorzata Olszówka <Malgorzata.Olszowka@stunnel.org>
  *
+  * APPX files do not support nesting (multiple signature)
  */
 
 #define _FILE_OFFSET_BITS 64
@@ -16,10 +17,22 @@
 #include <zlib.h>
 #include <inttypes.h>
 
+#ifndef PRIX64
+#if defined(_MSC_VER)
+#define PRIX64 "I64X"
+#else /* _MSC_VER */
+#if ULONG_MAX == 0xFFFFFFFFFFFFFFFF
+#define PRIX64 "lX"
+#else /* ULONG_MAX == 0xFFFFFFFFFFFFFFFF */
+#define PRIX64 "llX"
+#endif /* ULONG_MAX == 0xFFFFFFFFFFFFFFFF */
+#endif /* _MSC_VER */
+#endif /* PRIX64 */
+
 #if defined(_MSC_VER)
 #define fseeko _fseeki64
 #define ftello _ftelli64
-#endif
+#endif /* _MSC_VER */
 
 #define EOCDR_SIZE 22
 #define ZIP64_EOCD_LOCATOR_SIZE 20
@@ -140,6 +153,8 @@ typedef struct zipCentralDirectoryEntry_struct {
     struct zipCentralDirectoryEntry_struct *next;
 } ZIP_CENTRAL_DIRECTORY_ENTRY;
 
+DEFINE_STACK_OF(ZIP_CENTRAL_DIRECTORY_ENTRY)
+
 /* Zip64 end of central directory record */
 typedef struct {
     uint64_t eocdrSize;
@@ -233,26 +248,30 @@ struct appx_ctx_st {
 
 /* FILE_FORMAT method prototypes */
 static FILE_FORMAT_CTX *appx_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *outdata);
+static const EVP_MD *appx_md_get(FILE_FORMAT_CTX *ctx);
 static ASN1_OBJECT *appx_spc_sip_info_get(u_char **p, int *plen, FILE_FORMAT_CTX *ctx);
+static PKCS7 *appx_pkcs7_contents_get(FILE_FORMAT_CTX *ctx, BIO *hash, const EVP_MD *md);
 static int appx_hash_length_get(FILE_FORMAT_CTX *ctx);
-static int appx_check_file(FILE_FORMAT_CTX *ctx, int detached);
 static int appx_verify_digests(FILE_FORMAT_CTX *ctx, PKCS7 *p7);
 static PKCS7 *appx_pkcs7_extract(FILE_FORMAT_CTX *ctx);
 static int appx_remove_pkcs7(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
-static PKCS7 *appx_pkcs7_prepare(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+static int appx_process_data(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+static PKCS7 *appx_pkcs7_signature_new(FILE_FORMAT_CTX *ctx, BIO *hash);
 static int appx_append_pkcs7(FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7);
-static BIO *appx_bio_free(BIO *hash, BIO *outdata);
-static void appx_ctx_cleanup(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+static void appx_bio_free(BIO *hash, BIO *outdata);
+static void appx_ctx_cleanup(FILE_FORMAT_CTX *ctx);
 
 FILE_FORMAT file_format_appx = {
     .ctx_new = appx_ctx_new,
+    .md_get = appx_md_get,
     .data_blob_get = appx_spc_sip_info_get,
+    .pkcs7_contents_get = appx_pkcs7_contents_get,
     .hash_length_get = appx_hash_length_get,
-    .check_file = appx_check_file,
     .verify_digests = appx_verify_digests,
     .pkcs7_extract = appx_pkcs7_extract,
     .remove_pkcs7 = appx_remove_pkcs7,
-    .pkcs7_prepare = appx_pkcs7_prepare,
+    .process_data = appx_process_data,
+    .pkcs7_signature_new = appx_pkcs7_signature_new,
     .append_pkcs7 = appx_append_pkcs7,
     .bio_free = appx_bio_free,
     .ctx_cleanup = appx_ctx_cleanup,
@@ -284,6 +303,7 @@ static int zipInflate(uint8_t *dest, uint64_t *destLen, uint8_t *source, uLong *
 static int zipDeflate(uint8_t *dest, uint64_t *destLen, uint8_t *source, uLong sourceLen);
 static ZIP_FILE *openZip(const char *filename);
 static void freeZip(ZIP_FILE *zip);
+static ZIP_FILE *zipSortCentralDirectory(ZIP_FILE *zip);
 static void zipPrintCentralDirectory(ZIP_FILE *zip);
 static int zipReadCentralDirectory(ZIP_FILE *zip, FILE *file);
 static ZIP_CENTRAL_DIRECTORY_ENTRY *zipReadNextCentralDirectoryEntry(FILE *file);
@@ -344,10 +364,8 @@ static FILE_FORMAT_CTX *appx_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *ou
     if (zipGetCDEntryByName(zip, APPXBUNDLE_MANIFEST_FILENAME)) {
         ctx->appx_ctx->isBundle = 1;
     }
-    if (options->nest)
-        /* I've not tried using set_nested_signature as signtool won't do this */
-        printf("Warning: APPX files do not support nesting (multiple signature)\n");
-    if (options->cmd == CMD_SIGN || options->cmd==CMD_ATTACH || options->cmd==CMD_ADD) {
+    if (options->cmd == CMD_SIGN || options->cmd==CMD_ATTACH
+        || options->cmd==CMD_ADD || options->cmd == CMD_EXTRACT_DATA) {
         printf("Warning: Ignore -h option, use the hash algorithm specified in AppxBlockMap.xml\n");
     }
     if (options->pagehash == 1)
@@ -357,6 +375,16 @@ static FILE_FORMAT_CTX *appx_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *ou
     if (options->add_msi_dse == 1)
         printf("Warning: -add-msi-dse option is only valid for MSI files\n");
     return ctx;
+}
+
+/*
+ * Return a hash algorithm specified in the AppxBlockMap.xml file.
+ * [in] ctx: structure holds input and output data
+ * [returns] hash algorithm
+ */
+static const EVP_MD *appx_md_get(FILE_FORMAT_CTX *ctx)
+{
+    return ctx->appx_ctx->md;
 }
 
 /*
@@ -395,6 +423,41 @@ static ASN1_OBJECT *appx_spc_sip_info_get(u_char **p, int *plen, FILE_FORMAT_CTX
 }
 
 /*
+ * Allocate and return a data content to be signed.
+ * [in] ctx: structure holds input and output data
+ * [in] hash: message digest BIO
+ * [in] md: message digest algorithm
+ * [returns] data content
+ */
+static PKCS7 *appx_pkcs7_contents_get(FILE_FORMAT_CTX *ctx, BIO *hash, const EVP_MD *md)
+{
+    ASN1_OCTET_STRING *content;
+    ZIP_CENTRAL_DIRECTORY_ENTRY *entry;
+    BIO *bhash;
+
+    /* squash unused parameter warnings */
+    (void)md;
+    (void)hash;
+
+    /* Create and append a new signature content types entry */
+    entry = zipGetCDEntryByName(ctx->appx_ctx->zip, CONTENT_TYPES_FILENAME);
+    if (!entry) {
+        printf("Not a valid .appx file: content types file missing\n");
+        return NULL; /* FAILED */
+    }
+    if (!appx_append_ct_signature_entry(ctx->appx_ctx->zip, entry)) {
+        return NULL; /* FAILED */
+    }
+    bhash = appx_calculate_hashes(ctx);
+    if (!bhash) {
+        return NULL; /* FAILED */
+    }
+    content = spc_indirect_data_content_get(bhash, ctx);
+    BIO_free_all(bhash);
+    return pkcs7_set_content(content);
+}
+
+/*
  * Get concatenated hashes length.
  * [in] ctx: structure holds input and output data
  * [returns] the length of concatenated hashes
@@ -402,25 +465,6 @@ static ASN1_OBJECT *appx_spc_sip_info_get(u_char **p, int *plen, FILE_FORMAT_CTX
 static int appx_hash_length_get(FILE_FORMAT_CTX *ctx)
 {
     return ctx->appx_ctx->hashlen;
-}
-
-/*
- * Check if the signature exists.
- * [in] ctx: structure holds input and output data
- * [in] detached: embedded/detached PKCS#7 signature switch
- * [returns] 0 on error or 1 on success
- */
-static int appx_check_file(FILE_FORMAT_CTX *ctx, int detached)
-{
-    if (detached) {
-        printf("APPX format does not support detached PKCS#7 signature\n");
-        return 0; /* FAILED */
-    }
-    if (!zipEntryExist(ctx->appx_ctx->zip, APP_SIGNATURE_FILENAME)) {
-        printf("%s does not exist\n", APP_SIGNATURE_FILENAME);
-        return 0; /* FAILED */
-    }
-    return 1; /* OK */
 }
 
 /*
@@ -472,6 +516,11 @@ static PKCS7 *appx_pkcs7_extract(FILE_FORMAT_CTX *ctx)
     const u_char *blob;
     size_t dataSize;
 
+    /* Check if the signature exists */
+    if (!zipEntryExist(ctx->appx_ctx->zip, APP_SIGNATURE_FILENAME)) {
+        printf("%s does not exist\n", APP_SIGNATURE_FILENAME);
+        return NULL; /* FAILED */
+    }
     dataSize = zipReadFileDataByName(&data, ctx->appx_ctx->zip, APP_SIGNATURE_FILENAME);
     if (dataSize <= 0) {
         return NULL; /* FAILED */
@@ -497,6 +546,8 @@ static PKCS7 *appx_pkcs7_extract(FILE_FORMAT_CTX *ctx)
  */
 static int appx_remove_pkcs7(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
 {
+    uint8_t *data = NULL;
+    size_t dataSize;
     uint64_t cdOffset, noEntries = 0;
     ZIP_FILE *zip = ctx->appx_ctx->zip;
     ZIP_CENTRAL_DIRECTORY_ENTRY *entry = zipGetCDEntryByName(zip, CONTENT_TYPES_FILENAME);
@@ -508,6 +559,12 @@ static int appx_remove_pkcs7(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
         printf("Not a valid .appx file: content types file missing\n");
         return 1; /* FAILED */
     }
+    /* read signature data */
+    dataSize = zipReadFileDataByName(&data, ctx->appx_ctx->zip, APP_SIGNATURE_FILENAME);
+    if (dataSize <= 0) {
+        return 1; /* FAILED, no signature */
+    }
+    OPENSSL_free(data);
     if (!appx_remove_ct_signature_entry(zip, entry)) {
         printf("Failed to remove signature entry\n");
         return 1; /* FAILED */
@@ -541,64 +598,78 @@ static int appx_remove_pkcs7(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
 }
 
 /*
- * Obtain an existing signature or create a new one.
+ * Modify specific type data.
  * [in, out] ctx: structure holds input and output data
  * [out] hash: message digest BIO (unused)
  * [out] outdata: outdata file BIO (unused)
- * [returns] pointer to PKCS#7 structure
+ * [returns] 1 on error or 0 on success
  */
-static PKCS7 *appx_pkcs7_prepare(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
+static int appx_process_data(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
 {
-    PKCS7 *cursig = NULL, *p7 = NULL;
+    ZIP_CENTRAL_DIRECTORY_ENTRY *entry;
 
     /* squash unused parameter warnings */
     (void)outdata;
     (void)hash;
 
-    if (ctx->options->cmd == CMD_ADD || ctx->options->cmd == CMD_ATTACH) {
-        /* Obtain an existing signature */
-        cursig = appx_pkcs7_extract(ctx);
-        if (!cursig) {
-            printf("Unable to extract existing signature\n");
-            return NULL; /* FAILED */
-        }
-        return cursig;
-    } else if (ctx->options->cmd == CMD_SIGN) {
-        BIO *hashes;
-        ZIP_CENTRAL_DIRECTORY_ENTRY *entry;
-
-        /* Create a new signature */
-        entry = zipGetCDEntryByName(ctx->appx_ctx->zip, CONTENT_TYPES_FILENAME);
-        if (!entry) {
-            printf("Not a valid .appx file: content types file missing\n");
-            return NULL; /* FAILED */
-        }
-        if (!appx_append_ct_signature_entry(ctx->appx_ctx->zip, entry)) {
-            return NULL; /* FAILED */
-        }
-        /* create hash blob from concatenated APPX hashes */
-        hashes = appx_calculate_hashes(ctx);
-        if (!hashes) {
-            return NULL; /* FAILED */
-        }
-        /* Create a new PKCS#7 signature */
-        p7 = pkcs7_create(ctx);
-        if (!p7) {
-            printf("Creating a new signature failed\n");
-            return NULL; /* FAILED */
-        }
-        if (!add_indirect_data_object(p7)) {
-            printf("Adding SPC_INDIRECT_DATA_OBJID failed\n");
-            BIO_free_all(hashes);
-            PKCS7_free(p7);
-            return NULL; /* FAILED */
-        }
-        if (!sign_spc_indirect_data_content(p7, hashes, ctx)) {
-            printf("Failed to set signed content\n");
-            return NULL; /* FAILED */
-        }
-        BIO_free_all(hashes);
+    /* Create and append a new signature content types entry */
+    entry = zipGetCDEntryByName(ctx->appx_ctx->zip, CONTENT_TYPES_FILENAME);
+    if (!entry) {
+        printf("Not a valid .appx file: content types file missing\n");
+        return 1; /* FAILED */
     }
+    if (!appx_append_ct_signature_entry(ctx->appx_ctx->zip, entry)) {
+        return 1; /* FAILED */
+    }
+    return 0; /* OK */
+}
+
+/*
+ * Create a new PKCS#7 signature.
+ * [in, out] ctx: structure holds input and output data
+ * [out] hash: message digest BIO (unused)
+ * [returns] pointer to PKCS#7 structure
+ */
+static PKCS7 *appx_pkcs7_signature_new(FILE_FORMAT_CTX *ctx, BIO *hash)
+{
+    ASN1_OCTET_STRING *content;
+    PKCS7 *p7 = NULL;
+    BIO *hashes;
+
+    /* squash unused parameter warnings */
+    (void)hash;
+
+    /* Create hash blob from concatenated APPX hashes */
+    hashes = appx_calculate_hashes(ctx);
+    if (!hashes) {
+        return NULL; /* FAILED */
+    }
+    p7 = pkcs7_create(ctx);
+    if (!p7) {
+        printf("Creating a new signature failed\n");
+        BIO_free_all(hashes);
+        return NULL; /* FAILED */
+    }
+    if (!add_indirect_data_object(p7)) {
+        printf("Adding SPC_INDIRECT_DATA_OBJID failed\n");
+        PKCS7_free(p7);
+        BIO_free_all(hashes);
+        return NULL; /* FAILED */
+    }
+    content = spc_indirect_data_content_get(hashes, ctx);
+    BIO_free_all(hashes);
+    if (!content) {
+        printf("Failed to get spcIndirectDataContent\n");
+        PKCS7_free(p7);
+        return NULL; /* FAILED */
+    }
+    if (!sign_spc_indirect_data_content(p7, content)) {
+        printf("Failed to set signed content\n");
+        PKCS7_free(p7);
+        ASN1_OCTET_STRING_free(content);
+        return NULL; /* FAILED */
+    }
+    ASN1_OCTET_STRING_free(content);
     return p7; /* OK */
 }
 
@@ -689,11 +760,10 @@ static int appx_append_pkcs7(FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7)
  * [out] outdata: outdata file BIO
  * [returns] none
  */
-static BIO *appx_bio_free(BIO *hash, BIO *outdata)
+static void appx_bio_free(BIO *hash, BIO *outdata)
 {
     BIO_free_all(outdata);
     BIO_free_all(hash);
-    return NULL; /* OK */
 }
 
 /*
@@ -703,12 +773,8 @@ static BIO *appx_bio_free(BIO *hash, BIO *outdata)
  * [in] outdata: outdata file BIO
  * [returns] none
  */
-static void appx_ctx_cleanup(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
+static void appx_ctx_cleanup(FILE_FORMAT_CTX *ctx)
 {
-    if (outdata) {
-        BIO_free_all(hash);
-        BIO_free_all(outdata);
-    }
     freeZip(ctx->appx_ctx->zip);
     OPENSSL_free(ctx->appx_ctx->calculatedBMHash);
     OPENSSL_free(ctx->appx_ctx->calculatedCTHash);
@@ -1533,7 +1599,7 @@ static int zipRewriteData(ZIP_FILE *zip, ZIP_CENTRAL_DIRECTORY_ENTRY *entry, BIO
 
     memset(&header, 0, sizeof(header));
     if (entry->offsetOfLocalHeader >= (uint64_t)zip->fileSize) {
-        printf("Corrupted relative offset of local header : 0x%08lX\n", entry->offsetOfLocalHeader);
+        printf("Corrupted relative offset of local header : 0x%08" PRIX64 "\n", entry->offsetOfLocalHeader);
         return 0; /* FAILED */
     }
     if (fseeko(zip->file, (int64_t)entry->offsetOfLocalHeader, SEEK_SET) < 0) {
@@ -1554,7 +1620,7 @@ static int zipRewriteData(ZIP_FILE *zip, ZIP_CENTRAL_DIRECTORY_ENTRY *entry, BIO
             return 0; /* FAILED */
         }
         if (entry->compressedSize > (uint64_t)zip->fileSize - entry->offsetOfLocalHeader) {
-            printf("Corrupted compressedSize : 0x%08lX\n", entry->compressedSize);
+            printf("Corrupted compressedSize : 0x%08" PRIX64 "\n", entry->compressedSize);
             return 0; /* FAILED */
         }
         if (fseeko(zip->file, (int64_t)entry->compressedSize, SEEK_CUR) < 0) {
@@ -1757,7 +1823,7 @@ static size_t zipReadFileData(ZIP_FILE *zip, uint8_t **pData, ZIP_CENTRAL_DIRECT
     size_t size, dataSize = 0;
 
     if (entry->offsetOfLocalHeader >= (uint64_t)zip->fileSize) {
-        printf("Corrupted relative offset of local header : 0x%08lX\n", entry->offsetOfLocalHeader);
+        printf("Corrupted relative offset of local header : 0x%08" PRIX64 "\n", entry->offsetOfLocalHeader);
         return 0; /* FAILED */
     }
     if (fseeko(file, (int64_t)entry->offsetOfLocalHeader, SEEK_SET) < 0) {
@@ -1789,7 +1855,7 @@ static size_t zipReadFileData(ZIP_FILE *zip, uint8_t **pData, ZIP_CENTRAL_DIRECT
         OPENSSL_free(header.extraField);
 
         if (compressedSize > (uint64_t)zip->fileSize - entry->offsetOfLocalHeader) {
-            printf("Corrupted compressedSize : 0x%08lX\n", entry->compressedSize);
+            printf("Corrupted compressedSize : 0x%08" PRIX64 "\n", entry->compressedSize);
             return 0; /* FAILED */
         }
         compressedData = OPENSSL_zalloc(compressedSize + 1);
@@ -1906,7 +1972,7 @@ static int zipReadLocalHeader(ZIP_LOCAL_HEADER *header, ZIP_FILE *zip, uint64_t 
             return 0; /* FAILED */
         }
         if (compressedSize > (uint64_t)(zip->fileSize - offset)) {
-            printf("Corrupted compressedSize : 0x%08lX\n", compressedSize);
+            printf("Corrupted compressedSize : 0x%08" PRIX64 "\n", compressedSize);
             return 0; /* FAILED */
         }
         if (fseeko(file, (int64_t)compressedSize, SEEK_CUR) < 0) {
@@ -2146,7 +2212,7 @@ static ZIP_FILE *openZip(const char *filename)
             return NULL; /* FAILED */
         }
         if (zip->locator.eocdOffset >= (uint64_t)zip->fileSize) {
-            printf("Corrupted end of central directory locator offset : 0x%08lX\n", zip->locator.eocdOffset);
+            printf("Corrupted end of central directory locator offset : 0x%08" PRIX64 "\n", zip->locator.eocdOffset);
             freeZip(zip);
             return 0; /* FAILED */
         }
@@ -2175,13 +2241,13 @@ static ZIP_FILE *openZip(const char *filename)
         zip->centralDirectorySize = zip->eocdr.centralDirectorySize;
         zip->centralDirectoryRecordCount = (uint64_t)zip->eocdr.totalEntries;
         if (zip->centralDirectoryRecordCount > UINT16_MAX) {
-            printf("Corrupted total number of entries in the central directory : 0x%08lX\n", zip->centralDirectoryRecordCount);
+            printf("Corrupted total number of entries in the central directory : 0x%08" PRIX64 "\n", zip->centralDirectoryRecordCount);
             freeZip(zip);
             return NULL; /* FAILED */
         }
     }
     if (zip->centralDirectoryOffset >= (uint64_t)zip->fileSize) {
-        printf("Corrupted central directory offset : 0x%08lX\n", zip->centralDirectoryOffset);
+        printf("Corrupted central directory offset : 0x%08" PRIX64 "\n", zip->centralDirectoryOffset);
         freeZip(zip);
         return NULL; /* FAILED */
     }
@@ -2189,7 +2255,7 @@ static ZIP_FILE *openZip(const char *filename)
         freeZip(zip);
         return NULL; /* FAILED */
     }
-    return zip;
+    return zipSortCentralDirectory(zip);
 }
 
 /*
@@ -2216,6 +2282,55 @@ static void freeZip(ZIP_FILE *zip)
         freeZipCentralDirectoryEntry(entry);
     }
     OPENSSL_free(zip);
+}
+
+/*
+ * Offset comparison function.
+ * [in] a_ptr, b_ptr: pointers to ZIP_CENTRAL_DIRECTORY_ENTRY structure
+ * [returns] entries order
+ */
+static int entry_compare(const ZIP_CENTRAL_DIRECTORY_ENTRY *const *a, const ZIP_CENTRAL_DIRECTORY_ENTRY *const *b)
+{
+    return (*a)->offsetOfLocalHeader < (*b)->offsetOfLocalHeader ? -1 : 1;
+}
+
+/*
+ * Sort central directory entries in ascending order by offset.
+ * [in] zip:  ZIP_FILE structure
+ * [returns] pointer to sorted ZIP_FILE structure
+ */
+static ZIP_FILE *zipSortCentralDirectory(ZIP_FILE *zip)
+{
+    uint64_t noEntries = 0;
+    int i;
+    ZIP_CENTRAL_DIRECTORY_ENTRY *entry;
+    STACK_OF(ZIP_CENTRAL_DIRECTORY_ENTRY) *chain = sk_ZIP_CENTRAL_DIRECTORY_ENTRY_new(entry_compare);
+
+    for (entry = zip->centralDirectoryHead; entry != NULL; entry = entry->next) {
+        if (noEntries >= zip->centralDirectoryRecordCount) {
+            printf("Corrupted central directory structure\n");
+            sk_ZIP_CENTRAL_DIRECTORY_ENTRY_free(chain);
+            freeZip(zip);
+            return NULL;
+        }
+        noEntries++;
+        if (!sk_ZIP_CENTRAL_DIRECTORY_ENTRY_push(chain, entry)) {
+            printf("Failed to add central directory entry\n");
+            sk_ZIP_CENTRAL_DIRECTORY_ENTRY_free(chain);
+            freeZip(zip);
+            return NULL;
+        }
+    }
+    sk_ZIP_CENTRAL_DIRECTORY_ENTRY_sort(chain);
+    zip->centralDirectoryHead = entry = sk_ZIP_CENTRAL_DIRECTORY_ENTRY_value(chain, 0);
+    for (i=1; i<sk_ZIP_CENTRAL_DIRECTORY_ENTRY_num(chain); i++) {
+        entry->next = sk_ZIP_CENTRAL_DIRECTORY_ENTRY_value(chain, i);
+        entry = entry->next;
+    }
+    entry->next = NULL;
+    sk_ZIP_CENTRAL_DIRECTORY_ENTRY_free(chain);
+
+    return zip;
 }
 
 /*
@@ -2573,7 +2688,7 @@ static int readZip64EOCDR(ZIP64_EOCDR *eocdr, FILE *file, uint64_t offset)
     /* zip64 extensible data sector (comment) */
     eocdr->commentLen = eocdr->eocdrSize - 44;
     if (eocdr->commentLen > UINT16_MAX) {
-        printf("Corrupted file comment length : 0x%08lX\n", eocdr->commentLen);
+        printf("Corrupted file comment length : 0x%08" PRIX64 "\n", eocdr->commentLen);
         return 0; /* FAILED */
     }
     if (eocdr->commentLen > 0) {

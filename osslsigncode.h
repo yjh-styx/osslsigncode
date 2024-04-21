@@ -14,6 +14,7 @@
 #define NOCRYPT
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winsock2.h>
 #endif /* HAVE_WINDOWS_H */
 
 #ifdef HAVE_CONFIG_H
@@ -32,6 +33,7 @@
 
 #ifndef _WIN32
 #include <unistd.h>
+#include <sys/socket.h>
 #ifdef HAVE_SYS_MMAN_H
 #include <sys/mman.h>
 #endif /* HAVE_SYS_MMAN_H */
@@ -63,6 +65,7 @@
 #endif /* OPENSSL_VERSION_NUMBER>=0x30000000L */
 #include <openssl/rand.h>
 #include <openssl/safestack.h>
+#include <openssl/ssl.h>
 #include <openssl/ts.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h> /* X509_PURPOSE */
@@ -74,14 +77,20 @@
 #endif /* SOCKET */
 #endif /* __CYGWIN__ */
 #include <curl/curl.h>
-
-#define MAX_TS_SERVERS 256
 #endif /* ENABLE_CURL */
+
+/* Request nonce length, in bits (must be a multiple of 8). */
+#define NONCE_LENGTH    64
+#define MAX_TS_SERVERS 256
 
 #if defined (HAVE_TERMIOS_H) || defined (HAVE_GETPASS)
 #define PROVIDE_ASKPASS 1
 #endif
 
+#ifdef _MSC_VER
+/* not WIN32, because strcasecmp exists in MinGW */
+#define strcasecmp _stricmp
+#endif
 
 #ifdef WIN32
 #define remove_file(filename) _unlink(filename)
@@ -176,6 +185,8 @@
 #define SPC_RFC3161_OBJID            "1.3.6.1.4.1.311.3.3.1"
 /* Microsoft OID Crypto 2.0 */
 #define MS_CTL_OBJID                 "1.3.6.1.4.1.311.10.1"
+/* Microsoft OID Catalog */
+#define CAT_NAMEVALUE_OBJID          "1.3.6.1.4.1.311.12.2.1"
 /* Microsoft OID Microsoft_Java */
 #define MS_JAVA_SOMETHING            "1.3.6.1.4.1.311.15.1"
 
@@ -185,6 +196,7 @@
 #define PKCS9_MESSAGE_DIGEST         "1.2.840.113549.1.9.4"
 #define PKCS9_SIGNING_TIME           "1.2.840.113549.1.9.5"
 #define PKCS9_COUNTER_SIGNATURE      "1.2.840.113549.1.9.6"
+#define PKCS9_SEQUENCE_NUMBER        "1.2.840.113549.1.9.25.4"
 
 /* WIN_CERTIFICATE structure declared in Wintrust.h */
 #define WIN_CERT_REVISION_2_0           0x0200
@@ -219,6 +231,7 @@
 typedef enum {
     CMD_SIGN,
     CMD_EXTRACT,
+    CMD_EXTRACT_DATA,
     CMD_REMOVE,
     CMD_VERIFY,
     CMD_ADD,
@@ -253,22 +266,24 @@ typedef struct {
     const EVP_MD *md;
     char *url;
     time_t time;
-#ifdef ENABLE_CURL
     char *turl[MAX_TS_SERVERS];
     int nturl;
     char *tsurl[MAX_TS_SERVERS];
     int ntsurl;
     char *proxy;
     int noverifypeer;
-#endif /* ENABLE_CURL */
     int addBlob;
     int nest;
+    int index;
     int ignore_timestamp;
+    int ignore_cdp;
     int verbose;
     int add_msi_dse;
     char *catalog;
     char *cafile;
     char *crlfile;
+    char *https_cafile;
+    char *https_crlfile;
     char *tsa_cafile;
     char *tsa_crlfile;
     char *leafhash;
@@ -283,10 +298,10 @@ typedef struct {
     STACK_OF(X509_CRL) *crls;
     cmd_type_t cmd;
     char *indata;
-    PKCS7 *prevsig;
     char *tsa_certfile;
     char *tsa_keyfile;
     time_t tsa_time;
+    int nested_number;
 } GLOBAL_OPTIONS;
 
 /*
@@ -326,6 +341,18 @@ typedef struct {
 } SpcSpOpusInfo;
 
 DECLARE_ASN1_FUNCTIONS(SpcSpOpusInfo)
+
+typedef struct {
+    ASN1_INTEGER *a;
+    ASN1_OCTET_STRING *string;
+    ASN1_INTEGER *b;
+    ASN1_INTEGER *c;
+    ASN1_INTEGER *d;
+    ASN1_INTEGER *e;
+    ASN1_INTEGER *f;
+} SpcSipInfo;
+
+DECLARE_ASN1_FUNCTIONS(SpcSipInfo)
 
 typedef struct {
     ASN1_OBJECT *type;
@@ -370,8 +397,6 @@ typedef struct {
 
 DECLARE_ASN1_FUNCTIONS(MessageImprint)
 
-#ifdef ENABLE_CURL
-
 typedef struct {
     ASN1_OBJECT *type;
     ASN1_OCTET_STRING *signature;
@@ -413,8 +438,6 @@ typedef struct {
 } TimeStampReq;
 
 DECLARE_ASN1_FUNCTIONS(TimeStampReq)
-
-#endif /* ENABLE_CURL */
 
 typedef struct {
     ASN1_INTEGER *seconds;
@@ -462,7 +485,17 @@ typedef struct {
 
 DECLARE_ASN1_FUNCTIONS(MsCtlContent)
 
+typedef struct {
+    char *server;
+    const char *port;
+    int use_proxy;
+    int timeout;
+    SSL_CTX *ssl_ctx;
+} HTTP_TLS_Info;
+
 typedef struct file_format_st FILE_FORMAT;
+
+typedef struct script_ctx_st SCRIPT_CTX;
 typedef struct msi_ctx_st MSI_CTX;
 typedef struct pe_ctx_st PE_CTX;
 typedef struct cab_ctx_st CAB_CTX;
@@ -473,6 +506,7 @@ typedef struct {
     FILE_FORMAT *format;
     GLOBAL_OPTIONS *options;
     union {
+        SCRIPT_CTX *script_ctx;
         MSI_CTX *msi_ctx;
         PE_CTX *pe_ctx;
         CAB_CTX *cab_ctx;
@@ -481,6 +515,7 @@ typedef struct {
     };
 } FILE_FORMAT_CTX;
 
+extern FILE_FORMAT file_format_script;
 extern FILE_FORMAT file_format_msi;
 extern FILE_FORMAT file_format_pe;
 extern FILE_FORMAT file_format_cab;
@@ -489,19 +524,23 @@ extern FILE_FORMAT file_format_appx;
 
 struct file_format_st {
     FILE_FORMAT_CTX *(*ctx_new) (GLOBAL_OPTIONS *option, BIO *hash, BIO *outdata);
+    const EVP_MD *(*md_get) (FILE_FORMAT_CTX *ctx);
     ASN1_OBJECT *(*data_blob_get) (u_char **p, int *plen, FILE_FORMAT_CTX *ctx);
+    PKCS7 *(*pkcs7_contents_get) (FILE_FORMAT_CTX *ctx, BIO *hash, const EVP_MD *md);
     int (*hash_length_get) (FILE_FORMAT_CTX *ctx);
-    int (*check_file) (FILE_FORMAT_CTX *ctx, int detached);
     u_char *(*digest_calc) (FILE_FORMAT_CTX *ctx, const EVP_MD *md);
     int (*verify_digests) (FILE_FORMAT_CTX *ctx, PKCS7 *p7);
     int (*verify_indirect_data) (FILE_FORMAT_CTX *ctx, SpcAttributeTypeAndOptionalValue *obj);
     PKCS7 *(*pkcs7_extract) (FILE_FORMAT_CTX *ctx);
+    PKCS7 *(*pkcs7_extract_to_nest) (FILE_FORMAT_CTX *ctx);
     int (*remove_pkcs7) (FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
-    PKCS7 *(*pkcs7_prepare) (FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+    int (*process_data) (FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+    PKCS7 *(*pkcs7_signature_new) (FILE_FORMAT_CTX *ctx, BIO *hash);
     int (*append_pkcs7) (FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7);
     void (*update_data_size) (FILE_FORMAT_CTX *data, BIO *outdata, PKCS7 *p7);
-    BIO *(*bio_free) (BIO *hash, BIO *outdata);
-    void (*ctx_cleanup) (FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+    void (*bio_free) (BIO *hash, BIO *outdata);
+    void (*ctx_cleanup) (FILE_FORMAT_CTX *ctx);
+    int (*is_detaching_supported) (void);
 };
 
 /*

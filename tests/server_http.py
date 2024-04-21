@@ -6,7 +6,8 @@ import subprocess
 import sys
 import threading
 from urllib.parse import urlparse
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 
 RESULT_PATH = os.getcwd()
 FILES_PATH = os.path.join(RESULT_PATH, "./Testing/files/")
@@ -27,6 +28,8 @@ OPENSSL_TS = ["openssl", "ts",
     "-queryfile", REQUEST,
     "-out", RESPONS]
 
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 class RequestHandler(SimpleHTTPRequestHandler):
     """Handle the HTTP POST request that arrive at the server"""
@@ -41,8 +44,9 @@ class RequestHandler(SimpleHTTPRequestHandler):
         try:
             url = urlparse(self.path)
             self.send_response(200)
-            self.send_header("Content-type", "application/crl")
+            self.send_header("Content-type", "application/pkix-crl")
             self.end_headers()
+            resp_data = b''
             # Read the file and send the contents
             if url.path == "/intermediateCA":
                 with open(CACRL, 'rb') as file:
@@ -52,7 +56,8 @@ class RequestHandler(SimpleHTTPRequestHandler):
                     resp_data = file.read()
             self.wfile.write(resp_data)
         except Exception as err: # pylint: disable=broad-except
-            print(f"HTTP GET request error: {err}")
+            print("HTTP GET request error: {}".format(err))
+
 
     def do_POST(self): # pylint: disable=invalid-name
         """"Serves the POST request type"""
@@ -76,12 +81,12 @@ class RequestHandler(SimpleHTTPRequestHandler):
                 openssl.check_returncode()
                 self.send_header("Content-type", "application/timestamp-reply")
                 self.end_headers()
-                resp_data = None
+                resp_data = b''
                 with open(RESPONS, mode="rb") as file:
                     resp_data = file.read()
                 self.wfile.write(resp_data)
         except Exception as err: # pylint: disable=broad-except
-            print(f"HTTP POST request error: {err}")
+            print("HTTP POST request error: {}".format(err))
 
 
 class HttpServerThread():
@@ -93,12 +98,12 @@ class HttpServerThread():
         self.server_thread = None
 
     def start_server(self, port) -> (int):
-        """Starting HTTP server on localhost and a random available port for binding"""
-        self.server = ThreadingHTTPServer(('localhost', port), RequestHandler)
+        """Starting HTTP server on 127.0.0.1 and a random available port for binding"""
+        self.server = ThreadingHTTPServer(('127.0.0.1', port), RequestHandler)
         self.server_thread = threading.Thread(target=self.server.serve_forever)
         self.server_thread.start()
         hostname, port = self.server.server_address[:2]
-        print(f"HTTP server started, URL http://{hostname}:{port}")
+        print("HTTP server started, URL http://{}:{}".format(hostname, port))
         return port
 
 
@@ -119,7 +124,7 @@ def main() -> None:
         with open(PORT_LOG, mode="w") as file:
             file.write("{}".format(port))
     except OSError as err:
-        print(f"OSError: {err}")
+        print("OSError: {}".format(err))
         ret = err.errno
     finally:
         sys.exit(ret)
@@ -131,7 +136,7 @@ if __name__ == '__main__':
         if fpid > 0:
             sys.exit(0)
     except OSError as ferr:
-        print(f"Fork #1 failed: {ferr.errno} {ferr.strerror}")
+        print("Fork #1 failed: {} {}".format(ferr.errno, ferr.strerror))
         sys.exit(1)
 
     try:
@@ -139,7 +144,7 @@ if __name__ == '__main__':
         if fpid > 0:
             sys.exit(0)
     except OSError as ferr:
-        print(f"Fork #2 failed: {ferr.errno} {ferr.strerror}")
+        print("Fork #2 failed: {} {}".format(ferr.errno, ferr.strerror))
         sys.exit(1)
 
     # Start the daemon main loop

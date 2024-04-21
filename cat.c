@@ -5,15 +5,27 @@
  * Author: Małgorzata Olszówka <Malgorzata.Olszowka@stunnel.org>
  *
  * Catalog files are a bit odd, in that they are only a PKCS7 blob.
+ * CAT files do not support nesting (multiple signature)
  */
 
 #include "osslsigncode.h"
 #include "helpers.h"
 
-const u_char pkcs7_signed_data[] = {
-    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d,
-    0x01, 0x07, 0x02,
-};
+typedef struct {
+    ASN1_BMPSTRING *tag;
+    ASN1_INTEGER *flags;
+    ASN1_OCTET_STRING *value;
+} CatNameValueContent;
+
+DECLARE_ASN1_FUNCTIONS(CatNameValueContent)
+
+ASN1_SEQUENCE(CatNameValueContent) = {
+    ASN1_SIMPLE(CatNameValueContent, tag, ASN1_BMPSTRING),
+    ASN1_SIMPLE(CatNameValueContent, flags, ASN1_INTEGER),
+    ASN1_SIMPLE(CatNameValueContent, value, ASN1_OCTET_STRING)
+} ASN1_SEQUENCE_END(CatNameValueContent)
+
+IMPLEMENT_ASN1_FUNCTIONS(CatNameValueContent)
 
 struct cat_ctx_st {
     uint32_t sigpos;
@@ -24,20 +36,18 @@ struct cat_ctx_st {
 
 /* FILE_FORMAT method prototypes */
 static FILE_FORMAT_CTX *cat_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *outdata);
-static int cat_check_file(FILE_FORMAT_CTX *ctx, int detached);
 static int cat_verify_digests(FILE_FORMAT_CTX *ctx, PKCS7 *p7);
 static PKCS7 *cat_pkcs7_extract(FILE_FORMAT_CTX *ctx);
-static PKCS7 *cat_pkcs7_prepare(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+static PKCS7 *cat_pkcs7_signature_new(FILE_FORMAT_CTX *ctx, BIO *hash);
 static int cat_append_pkcs7(FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7);
-static BIO *cat_bio_free(BIO *hash, BIO *outdata);
-static void cat_ctx_cleanup(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+static void cat_bio_free(BIO *hash, BIO *outdata);
+static void cat_ctx_cleanup(FILE_FORMAT_CTX *ctx);
 
 FILE_FORMAT file_format_cat = {
     .ctx_new = cat_ctx_new,
-    .check_file = cat_check_file,
     .verify_digests = cat_verify_digests,
     .pkcs7_extract = cat_pkcs7_extract,
-    .pkcs7_prepare = cat_pkcs7_prepare,
+    .pkcs7_signature_new = cat_pkcs7_signature_new,
     .append_pkcs7 = cat_append_pkcs7,
     .bio_free = cat_bio_free,
     .ctx_cleanup = cat_ctx_cleanup,
@@ -47,6 +57,12 @@ FILE_FORMAT file_format_cat = {
 static CAT_CTX *cat_ctx_get(char *indata, uint32_t filesize);
 static int cat_add_ms_ctl_object(PKCS7 *p7);
 static int cat_sign_ms_ctl_content(PKCS7 *p7, PKCS7 *contents);
+static int cat_list_content(PKCS7 *p7);
+static int cat_print_content_member_digest(ASN1_TYPE *content);
+static int cat_print_content_member_name(ASN1_TYPE *content);
+static void cat_print_base64(ASN1_OCTET_STRING *value);
+static void cat_print_utf16_as_ascii(ASN1_OCTET_STRING *value);
+static int cat_check_file(FILE_FORMAT_CTX *ctx);
 
 /*
  * FILE_FORMAT method definitions
@@ -65,7 +81,7 @@ static FILE_FORMAT_CTX *cat_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *out
     CAT_CTX *cat_ctx;
     uint32_t filesize;
 
-    if (options->cmd == CMD_REMOVE || options->cmd==CMD_ATTACH) {
+    if (options->cmd == CMD_REMOVE || options->cmd==CMD_ATTACH || options->cmd == CMD_EXTRACT_DATA) {
         printf("Unsupported command\n");
         return NULL; /* FAILED */
     }
@@ -77,15 +93,9 @@ static FILE_FORMAT_CTX *cat_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *out
     if (!options->indata) {
         return NULL; /* FAILED */
     }
-    /* the maximum size of a supported cat file is (2^24 -1) bytes */
-    if (memcmp(options->indata + ((GET_UINT8_LE(options->indata+1) == 0x82) ? 4 : 5),
-            pkcs7_signed_data, sizeof pkcs7_signed_data)) {
-        unmap_file(options->infile, filesize);
-        return NULL; /* FAILED */
-    }
     cat_ctx = cat_ctx_get(options->indata, filesize);
     if (!cat_ctx) {
-        unmap_file(options->infile, filesize);
+        unmap_file(options->indata, filesize);
         return NULL; /* FAILED */
     }
     ctx = OPENSSL_malloc(sizeof(FILE_FORMAT_CTX));
@@ -97,10 +107,7 @@ static FILE_FORMAT_CTX *cat_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *out
     BIO_push(hash, outdata);
 
     if (options->cmd == CMD_VERIFY)
-        printf("Warning: Use -catalog option to verify that a file, listed in catalog file, is signed\n\n");
-    if (options->nest)
-        /* I've not tried using set_nested_signature as signtool won't do this */
-        printf("Warning: CAT files do not support nesting (multiple signature)\n");
+        printf("Warning: Use -catalog option to verify that a file, listed in catalog file, is signed\n");
     if (options->jp >= 0)
         printf("Warning: -jp option is only valid for CAB files\n");
     if (options->pagehash == 1)
@@ -108,32 +115,6 @@ static FILE_FORMAT_CTX *cat_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *out
     if (options->add_msi_dse == 1)
         printf("Warning: -add-msi-dse option is only valid for MSI files\n");
     return ctx;
-}
-
-static int cat_check_file(FILE_FORMAT_CTX *ctx, int detached)
-{
-    STACK_OF(PKCS7_SIGNER_INFO) *signer_info;
-    PKCS7_SIGNER_INFO *si;
-
-    if (!ctx) {
-        printf("Init error\n\n");
-        return 0; /* FAILED */
-    }
-    if (detached) {
-        printf("CAT format does not support detached PKCS#7 signature\n\n");
-        return 0; /* FAILED */
-    }
-    signer_info = PKCS7_get_signer_info(ctx->cat_ctx->p7);
-    if (!signer_info) {
-        printf("Failed catalog file\n\n");
-        return 0; /* FAILED */
-    }
-    si = sk_PKCS7_SIGNER_INFO_value(signer_info, 0);
-    if (!si) {
-        printf("No signature found\n\n");
-        return 0; /* FAILED */
-    }
-    return 1; /* OK */
 }
 
 /*
@@ -156,73 +137,53 @@ static int cat_verify_digests(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
  */
 static PKCS7 *cat_pkcs7_extract(FILE_FORMAT_CTX *ctx)
 {
+    if (!cat_check_file(ctx)) {
+        return NULL; /* FAILED */
+    }
     return PKCS7_dup(ctx->cat_ctx->p7);
 }
 
 /*
- * Obtain an existing signature or create a new one.
+ * Create a new PKCS#7 signature.
  * [in, out] ctx: structure holds input and output data
  * [out] hash: message digest BIO (unused)
- * [out] outdata: outdata file BIO (unused)
  * [returns] pointer to PKCS#7 structure
  */
-static PKCS7 *cat_pkcs7_prepare(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
+static PKCS7 *cat_pkcs7_signature_new(FILE_FORMAT_CTX *ctx, BIO *hash)
 {
     PKCS7 *p7 = NULL;
 
     /* squash unused parameter warnings */
-    (void)outdata;
     (void)hash;
 
-    /* Obtain an existing signature */
-    if (ctx->options->cmd == CMD_ADD || ctx->options->cmd == CMD_ATTACH) {
-        p7 = PKCS7_dup(ctx->cat_ctx->p7);
-    } else if (ctx->options->cmd == CMD_SIGN) {
-        /* Create a new signature */
-        p7 = pkcs7_create(ctx);
-        if (!p7) {
-            printf("Creating a new signature failed\n");
-            return NULL; /* FAILED */
-        }
-        if (!cat_add_ms_ctl_object(p7)) {
-            printf("Adding MS_CTL_OBJID failed\n");
-            PKCS7_free(p7);
-            return NULL; /* FAILED */
-        }
-        if (!cat_sign_ms_ctl_content(p7, ctx->cat_ctx->p7->d.sign->contents)) {
-            printf("Failed to set signed content\n");
-            PKCS7_free(p7);
-            return 0; /* FAILED */
-        }
-   }
+    p7 = pkcs7_create(ctx);
+    if (!p7) {
+        printf("Creating a new signature failed\n");
+        return NULL; /* FAILED */
+    }
+    if (!cat_add_ms_ctl_object(p7)) {
+        printf("Adding MS_CTL_OBJID failed\n");
+        PKCS7_free(p7);
+        return NULL; /* FAILED */
+    }
+    if (!cat_sign_ms_ctl_content(p7, ctx->cat_ctx->p7->d.sign->contents)) {
+        printf("Failed to set signed content\n");
+        PKCS7_free(p7);
+        return 0; /* FAILED */
+    }
     return p7; /* OK */
 }
 
 /*
  * Append signature to the outfile.
- * [in, out] ctx: structure holds input and output data (unused)
+ * [in, out] ctx: structure holds input and output data
  * [out] outdata: outdata file BIO
  * [in] p7: PKCS#7 signature
  * [returns] 1 on error or 0 on success
  */
 static int cat_append_pkcs7(FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7)
 {
-    u_char *p = NULL;
-    int len; /* signature length */
-
-    /* squash the unused parameter warning */
-    (void)ctx;
-
-    if (((len = i2d_PKCS7(p7, NULL)) <= 0)
-        || (p = OPENSSL_malloc((size_t)len)) == NULL) {
-        printf("i2d_PKCS memory allocation failed: %d\n", len);
-        return 1; /* FAILED */
-    }
-    i2d_PKCS7(p7, &p);
-    p -= len;
-    i2d_PKCS7_bio(outdata, p7);
-    OPENSSL_free(p);
-    return 0; /* OK */
+    return data_write_pkcs7(ctx, outdata, p7);
 }
 
 /*
@@ -231,13 +192,11 @@ static int cat_append_pkcs7(FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7)
  * [out] outdata: outdata file BIO (unused)
  * [returns] none
  */
-static BIO *cat_bio_free(BIO *hash, BIO *outdata)
+static void cat_bio_free(BIO *hash, BIO *outdata)
 {
     /* squash the unused parameter warning */
     (void)outdata;
-
     BIO_free_all(hash);
-    return NULL;
 }
 
 /*
@@ -248,11 +207,8 @@ static BIO *cat_bio_free(BIO *hash, BIO *outdata)
  * [in] outdata: outdata file BIO
  * [returns] none
  */
-static void cat_ctx_cleanup(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
+static void cat_ctx_cleanup(FILE_FORMAT_CTX *ctx)
 {
-    if (outdata) {
-        BIO_free_all(hash);
-    }
     unmap_file(ctx->options->indata, ctx->cat_ctx->fileend);
     PKCS7_free(ctx->cat_ctx->p7);
     OPENSSL_free(ctx->cat_ctx);
@@ -264,18 +220,23 @@ static void cat_ctx_cleanup(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
  */
 
 /*
- * Verify mapped CAT file and create CAT format specific structure.
- * [in] indata: mapped CAT file (unused)
- * [in] filesize: size of CAT file
+ * Verify mapped PKCS#7 (CAT) file and create CAT format specific structure.
+ * [in] indata: mapped file
+ * [in] filesize: size of file
  * [returns] pointer to CAT format specific structure
  */
 static CAT_CTX *cat_ctx_get(char *indata, uint32_t filesize)
 {
     CAT_CTX *cat_ctx;
-    PKCS7 *p7 = pkcs7_get(indata, 0, filesize);
+    PKCS7 *p7;
 
+    p7 = pkcs7_read_data(indata, filesize);
     if (!p7)
         return NULL; /* FAILED */
+    if (!PKCS7_type_is_signed(p7)) {
+        PKCS7_free(p7);
+        return NULL; /* FAILED */
+    }
     cat_ctx = OPENSSL_zalloc(sizeof(CAT_CTX));
     cat_ctx->p7 = p7;
     cat_ctx->sigpos = 0;
@@ -335,6 +296,179 @@ static int cat_sign_ms_ctl_content(PKCS7 *p7, PKCS7 *contents)
     return 1; /* OK */
 }
 
+/*
+ * Print each member of the CAT file by using the "-verbose" option.
+ * [in, out] p7: catalog file to verify
+ * [returns] 1 on error or 0 on success
+ */
+static int cat_list_content(PKCS7 *p7)
+{
+    MsCtlContent *ctlc;
+    int i;
+
+    ctlc = ms_ctl_content_get(p7);
+    if (!ctlc) {
+        printf("Failed to extract MS_CTL_OBJID data\n");
+        return 1; /* FAILED */
+    }
+    printf("\nCatalog members:\n");
+    for (i = 0; i < sk_CatalogInfo_num(ctlc->header_attributes); i++) {
+        int j, found = 0;
+        CatalogInfo *header_attr = sk_CatalogInfo_value(ctlc->header_attributes, i);
+        if (header_attr == NULL)
+            continue;
+        for (j = 0; j < sk_CatalogAuthAttr_num(header_attr->attributes); j++) {
+            char object_txt[128];
+            CatalogAuthAttr *attribute;
+            ASN1_TYPE *content;
+
+            attribute = sk_CatalogAuthAttr_value(header_attr->attributes, j);
+            if (!attribute)
+                continue;
+            content = catalog_content_get(attribute);
+            if (!content)
+                continue;
+            object_txt[0] = 0x00;
+            OBJ_obj2txt(object_txt, sizeof object_txt, attribute->type, 1);
+            if (!strcmp(object_txt, CAT_NAMEVALUE_OBJID)) {
+                /* CAT_NAMEVALUE_OBJID OID: 1.3.6.1.4.1.311.12.2.1 */
+                found |= cat_print_content_member_name(content);
+            } else if (!strcmp(object_txt, SPC_INDIRECT_DATA_OBJID)) {
+                /* SPC_INDIRECT_DATA_OBJID OID: 1.3.6.1.4.1.311.2.1.4 */
+                found |= cat_print_content_member_digest(content);
+            }
+            ASN1_TYPE_free(content);
+        }
+        if (found)
+            printf("\n");
+    }
+    MsCtlContent_free(ctlc);
+    ERR_print_errors_fp(stdout);
+    return 0; /* OK */
+}
+
+/*
+ * Print a hash algorithm and a message digest from the SPC_INDIRECT_DATA_OBJID attribute.
+ * [in] content: catalog file content
+ * [returns] 0 on error or 1 on success
+ */
+static int cat_print_content_member_digest(ASN1_TYPE *content)
+{
+    SpcIndirectDataContent *idc;
+    u_char mdbuf[EVP_MAX_MD_SIZE];
+    const u_char *data ;
+    int mdtype = -1;
+    ASN1_STRING *value;
+
+    value = content->value.sequence;
+    data = ASN1_STRING_get0_data(value);
+    idc = d2i_SpcIndirectDataContent(NULL, &data, ASN1_STRING_length(value));
+    if (!idc)
+        return 0; /* FAILED */
+    if (idc->messageDigest && idc->messageDigest->digest && idc->messageDigest->digestAlgorithm) {
+        /* get a digest algorithm a message digest of the file from the content */
+        mdtype = OBJ_obj2nid(idc->messageDigest->digestAlgorithm->algorithm);
+        memcpy(mdbuf, idc->messageDigest->digest->data, (size_t)idc->messageDigest->digest->length);
+    }
+    SpcIndirectDataContent_free(idc);
+    if (mdtype == -1) {
+        printf("Failed to extract current message digest\n\n");
+        return 0; /* FAILED */
+    }
+    printf("\tHash algorithm: %s\n", OBJ_nid2sn(mdtype));
+    print_hash("\tMessage digest", "", mdbuf, EVP_MD_size(EVP_get_digestbynid(mdtype)));
+    return 1; /* OK */
+}
+
+/*
+ * Print a file name from the CAT_NAMEVALUE_OBJID attribute.
+ * [in] content: catalog file content
+ * [returns] 0 on error or 1 on success
+ */
+static int cat_print_content_member_name(ASN1_TYPE *content)
+{
+    CatNameValueContent *nvc;
+    const u_char *data = NULL;
+    ASN1_STRING *value;
+
+    value = content->value.sequence;
+    data = ASN1_STRING_get0_data(value);
+    nvc = d2i_CatNameValueContent(NULL, &data, ASN1_STRING_length(value));
+    if (!nvc) {
+        return 0; /* FAILED */
+    }
+    printf("\tFile name: ");
+    if (ASN1_INTEGER_get(nvc->flags) & 0x00020000) {
+        cat_print_base64(nvc->value);
+    } else {
+        cat_print_utf16_as_ascii(nvc->value);
+    }
+    printf("\n");
+    CatNameValueContent_free(nvc);
+    return 1; /* OK */
+}
+
+/*
+ * Print a CAT_NAMEVALUE_OBJID attribute represented in base-64 encoding.
+ * [in] value: catalog member file name
+ * [returns] none
+ */
+static void cat_print_base64(ASN1_OCTET_STRING *value)
+{
+    BIO *stdbio, *b64;
+    stdbio = BIO_new_fp(stdout, BIO_NOCLOSE);
+    b64 = BIO_new(BIO_f_base64());
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    stdbio = BIO_push(b64, stdbio);
+    ASN1_STRING_print_ex(stdbio, value, 0);
+    BIO_free_all(stdbio);
+}
+
+/*
+ * Print a CAT_NAMEVALUE_OBJID attribute represented in plaintext.
+ * [in] value: catalog member file name
+ * [returns] none
+ */
+static void cat_print_utf16_as_ascii(ASN1_OCTET_STRING *value)
+{
+    const u_char *data;
+    int len, i;
+
+    data = ASN1_STRING_get0_data(value);
+    len = ASN1_STRING_length(value);
+    for (i = 0; i < len && (data[i] || data[i+1]); i+=2)
+        putchar(isprint(data[i]) && !data[i+1] ? data[i] : '.');
+}
+
+/*
+ * Check if the signature exists.
+ * [in, out] ctx: structure holds input and output data
+ * [returns] 0 on error or 1 on success
+ */
+static int cat_check_file(FILE_FORMAT_CTX *ctx)
+{
+    STACK_OF(PKCS7_SIGNER_INFO) *signer_info;
+    PKCS7_SIGNER_INFO *si;
+
+    if (!ctx) {
+        printf("Init error\n\n");
+        return 0; /* FAILED */
+    }
+    signer_info = PKCS7_get_signer_info(ctx->cat_ctx->p7);
+    if (!signer_info) {
+        printf("Failed catalog file\n\n");
+        return 0; /* FAILED */
+    }
+    si = sk_PKCS7_SIGNER_INFO_value(signer_info, 0);
+    if (!si) {
+        printf("No signature found\n\n");
+        return 0; /* FAILED */
+    }
+    if (ctx->options->verbose) {
+        (void)cat_list_content(ctx->cat_ctx->p7);
+    }
+    return 1; /* OK */
+}
 /*
 Local Variables:
    c-basic-offset: 4

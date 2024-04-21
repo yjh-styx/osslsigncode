@@ -10,7 +10,7 @@ set(BUILTIN_SOCKET ON CACHE BOOL "") # for static Python
 
 # configure basic project information
 project(osslsigncode
-    VERSION 2.8
+    VERSION 2.9
     DESCRIPTION "OpenSSL based Authenticode signing for PE, CAB, CAT and MSI files"
     HOMEPAGE_URL "https://github.com/mtrojnar/osslsigncode"
     LANGUAGES C)
@@ -29,7 +29,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # load CMake library modules
 include(FindOpenSSL)
-include(FindCURL)
+if(OPENSSL_VERSION VERSION_LESS "3.0.0")
+    include(FindCURL)
+endif(OPENSSL_VERSION VERSION_LESS "3.0.0")
 include(FindZLIB)
 
 # load CMake project modules
@@ -48,7 +50,7 @@ configure_file(Config.h.in config.h)
 target_compile_definitions(osslsigncode PRIVATE HAVE_CONFIG_H=1)
 
 # set sources
-target_sources(osslsigncode PRIVATE osslsigncode.c helpers.c msi.c pe.c cab.c cat.c appx.c)
+target_sources(osslsigncode PRIVATE osslsigncode.c helpers.c utf.c msi.c pe.c cab.c cat.c appx.c script.c)
 if(NOT UNIX)
     target_sources(osslsigncode PRIVATE applink.c)
 endif(NOT UNIX)
@@ -64,6 +66,7 @@ target_include_directories(osslsigncode PRIVATE ${OPENSSL_INCLUDE_DIR})
 target_link_libraries(osslsigncode PRIVATE ${OPENSSL_LIBRARIES})
 
 # set cURL includes/libraries
+if(OPENSSL_VERSION VERSION_LESS "3.0.0")
 if(CURL_FOUND)
     target_compile_definitions(osslsigncode PRIVATE ENABLE_CURL=1)
     target_include_directories(osslsigncode PRIVATE ${CURL_INCLUDE_DIRS})
@@ -72,12 +75,18 @@ if(CURL_FOUND)
 else(CURL_FOUND)
     message(STATUS "cURL support disabled (library not found)")
 endif(CURL_FOUND)
+endif(OPENSSL_VERSION VERSION_LESS "3.0.0")
 
 if(NOT ZLIB_FOUND)
     message(FATAL_ERROR "Zlib library not found")
 endif(NOT ZLIB_FOUND)
 target_include_directories(osslsigncode PRIVATE ${ZLIB_INCLUDE_DIR})
 target_link_libraries(osslsigncode PRIVATE ${ZLIB_LIBRARIES})
+
+if(NOT UNIX)
+# https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-shutdown
+target_link_libraries(osslsigncode PRIVATE Ws2_32.lib crypt32.lib)
+endif(NOT UNIX)
 
 # add paths to linker search and installed rpath
 set_target_properties(osslsigncode PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)

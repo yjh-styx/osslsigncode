@@ -123,6 +123,18 @@ ASN1_SEQUENCE(SpcSpOpusInfo) = {
 
 IMPLEMENT_ASN1_FUNCTIONS(SpcSpOpusInfo)
 
+ASN1_SEQUENCE(SpcSipInfo) = {
+    ASN1_SIMPLE(SpcSipInfo, a, ASN1_INTEGER),
+    ASN1_SIMPLE(SpcSipInfo, string, ASN1_OCTET_STRING),
+    ASN1_SIMPLE(SpcSipInfo, b, ASN1_INTEGER),
+    ASN1_SIMPLE(SpcSipInfo, c, ASN1_INTEGER),
+    ASN1_SIMPLE(SpcSipInfo, d, ASN1_INTEGER),
+    ASN1_SIMPLE(SpcSipInfo, e, ASN1_INTEGER),
+    ASN1_SIMPLE(SpcSipInfo, f, ASN1_INTEGER),
+} ASN1_SEQUENCE_END(SpcSipInfo)
+
+IMPLEMENT_ASN1_FUNCTIONS(SpcSipInfo)
+
 ASN1_SEQUENCE(SpcAttributeTypeAndOptionalValue) = {
     ASN1_SIMPLE(SpcAttributeTypeAndOptionalValue, type, ASN1_OBJECT),
     ASN1_OPT(SpcAttributeTypeAndOptionalValue, value, ASN1_ANY)
@@ -158,7 +170,6 @@ ASN1_SEQUENCE(CatalogAuthAttr) = {
 
 IMPLEMENT_ASN1_FUNCTIONS(CatalogAuthAttr)
 
-#ifdef ENABLE_CURL
 /*
  * Structures for Authenticode Timestamp
  */
@@ -176,7 +187,6 @@ ASN1_SEQUENCE(TimeStampRequest) = {
 
 IMPLEMENT_ASN1_FUNCTIONS(TimeStampRequest)
 
-#endif /* ENABLE_CURL */
 
 ASN1_SEQUENCE(CatalogInfo) = {
     ASN1_SIMPLE(CatalogInfo, digest, ASN1_OCTET_STRING),
@@ -197,32 +207,24 @@ ASN1_SEQUENCE(MsCtlContent) = {
 IMPLEMENT_ASN1_FUNCTIONS(MsCtlContent)
 
 /* Prototypes */
-static int signature_list_append_pkcs7(STACK_OF(PKCS7) **signatures, PKCS7 *p7, int allownest);
+static ASN1_INTEGER *create_nonce(int bits);
+static char *clrdp_url_get_x509(X509 *cert);
 static time_t time_t_get_asn1_time(const ASN1_TIME *s);
 static time_t time_t_get_si_time(PKCS7_SIGNER_INFO *si);
+static ASN1_UTCTIME *asn1_time_get_si_time(PKCS7_SIGNER_INFO *si);
 static time_t time_t_get_cms_time(CMS_ContentInfo *cms);
 static CMS_ContentInfo *cms_get_timestamp(PKCS7_SIGNED *p7_signed,
     PKCS7_SIGNER_INFO *countersignature);
+static int cursig_set_nested(PKCS7 *cursig, PKCS7 *p7);
+static int nested_signatures_number_get(PKCS7 *p7);
+static int X509_attribute_chain_append_object(STACK_OF(X509_ATTRIBUTE) **unauth_attr,
+    u_char *p, int len, const char *oid);
+static STACK_OF(PKCS7) *signature_list_create(PKCS7 *p7);
+static int PKCS7_compare(const PKCS7 *const *a, const PKCS7 *const *b);
+static PKCS7 *pkcs7_get_sigfile(FILE_FORMAT_CTX *ctx);
+static void print_cert(X509 *cert, int i);
+static int x509_store_load_crlfile(X509_STORE *store, char *cafile, char *crlfile);
 
-#ifdef ENABLE_CURL
-
-static int blob_has_nl = 0;
-
-/*
- * Callback for writing received data
- */
-static size_t curl_write(void *ptr, size_t sz, size_t nmemb, void *stream)
-{
-    size_t written, len = sz * nmemb;
-
-    if (len > 0 && !blob_has_nl) {
-        if (memchr(ptr, '\n', len))
-            blob_has_nl = 1;
-    }
-    if (!BIO_write_ex((BIO*)stream, ptr, len, &written) || written != len)
-        return 0; /* FAILED */
-    return written;
-}
 
 /*
   A timestamp request looks like this:
@@ -262,6 +264,7 @@ static BIO *bio_encode_rfc3161_request(PKCS7 *p7, const EVP_MD *md)
     PKCS7_SIGNER_INFO *si;
     u_char mdbuf[EVP_MAX_MD_SIZE];
     TS_MSG_IMPRINT *msg_imprint = NULL;
+    ASN1_INTEGER *nonce = NULL;
     X509_ALGOR *alg = NULL;
     TS_REQ *req = NULL;
     BIO *bout = NULL, *bhash = NULL;
@@ -306,6 +309,12 @@ static BIO *bio_encode_rfc3161_request(PKCS7 *p7, const EVP_MD *md)
         goto out;
     if (!TS_REQ_set_msg_imprint(req, msg_imprint))
         goto out;
+    /* Setting nonce */
+    nonce = create_nonce(NONCE_LENGTH);
+    if (!nonce)
+        goto out;
+    if (!TS_REQ_set_nonce(req, nonce))
+        goto out;
     /* TSA is expected to include its signing certificate in the response, flag 0xFF */
     if (!TS_REQ_set_cert_req(req, 1))
         goto out;
@@ -322,11 +331,42 @@ static BIO *bio_encode_rfc3161_request(PKCS7 *p7, const EVP_MD *md)
 
 out:
     BIO_free_all(bhash);
+    ASN1_INTEGER_free(nonce);
     TS_MSG_IMPRINT_free(msg_imprint);
     X509_ALGOR_free(alg);
     TS_REQ_free(req);
 
     return bout;
+}
+
+static ASN1_INTEGER *create_nonce(int bits)
+{
+    unsigned char buf[20];
+    ASN1_INTEGER *nonce = NULL;
+    int len = (bits - 1) / 8 + 1;
+    int i;
+
+    if (len > (int)sizeof(buf)) {
+        printf("Invalid nonce size\n");
+        return NULL;
+    }
+    if (RAND_bytes(buf, len) <= 0) {
+        printf("Random nonce generation failed\n");
+        return NULL;
+    }
+    /* Find the first non-zero byte and creating ASN1_INTEGER object. */
+    for (i = 0; i < len && !buf[i]; ++i) {
+    }
+    nonce = ASN1_INTEGER_new();
+    if (!nonce) {
+        printf("Could not create nonce\n");
+        return NULL;
+    }
+    OPENSSL_free(nonce->data);
+    nonce->length = len - i;
+    nonce->data = OPENSSL_malloc((size_t)nonce->length + 1);
+    memcpy(nonce->data, buf + i, (size_t)nonce->length);
+    return nonce;
 }
 
 /*
@@ -374,7 +414,7 @@ static BIO *bio_encode_authenticode_request(PKCS7 *p7)
 
 /*
  * If successful the RFC 3161 timestamp will be written into
- * the PKCS7 SignerInfo structure as an unauthorized attribute - cont[1].
+ * the PKCS7 SignerInfo structure as an unauthenticated attribute - cont[1].
  * [in, out] p7: new PKCS#7 signature
  * [in] response: RFC3161 response
  * [in] verbose: additional output mode
@@ -383,7 +423,6 @@ static BIO *bio_encode_authenticode_request(PKCS7 *p7)
 static int attach_rfc3161_response(PKCS7 *p7, TS_RESP *response, int verbose)
 {
     PKCS7_SIGNER_INFO *si;
-    STACK_OF(X509_ATTRIBUTE) *attrs;
     TS_STATUS_INFO *status;
     PKCS7 *token;
     u_char *p;
@@ -420,19 +459,17 @@ static int attach_rfc3161_response(PKCS7 *p7, TS_RESP *response, int verbose)
     }
     len = i2d_PKCS7(token, &p);
     p -= len;
-
-    attrs = sk_X509_ATTRIBUTE_new_null();
-    attrs = X509at_add1_attr_by_txt(&attrs, SPC_RFC3161_OBJID, V_ASN1_SET, p, len);
+    if (!X509_attribute_chain_append_object(&(si->unauth_attr), p, len, SPC_RFC3161_OBJID)) {
+        OPENSSL_free(p);
+        return 1; /* FAILED */
+    }
     OPENSSL_free(p);
-
-    PKCS7_set_attributes(si, attrs);
-    sk_X509_ATTRIBUTE_pop_free(attrs, X509_ATTRIBUTE_free);
     return 0; /* OK */
 }
 
 /*
  * If successful the authenticode timestamp will be written into
- * the PKCS7 SignerInfo structure as an unauthorized attribute - cont[1]:
+ * the PKCS7 SignerInfo structure as an unauthenticated attribute - cont[1]:
  * p7->d.sign->signer_info->unauth_attr
  * [in, out] p7: new PKCS#7 signature
  * [in] resp: PKCS#7 authenticode response
@@ -442,7 +479,6 @@ static int attach_rfc3161_response(PKCS7 *p7, TS_RESP *response, int verbose)
 static int attach_authenticode_response(PKCS7 *p7, PKCS7 *resp, int verbose)
 {
     PKCS7_SIGNER_INFO *info, *si;
-    STACK_OF(X509_ATTRIBUTE) *attrs;
     u_char *p;
     int len, i;
     STACK_OF(PKCS7_SIGNER_INFO) *signer_info;
@@ -474,39 +510,74 @@ static int attach_authenticode_response(PKCS7 *p7, PKCS7 *resp, int verbose)
     len = i2d_PKCS7_SIGNER_INFO(info, &p);
     p -= len;
     PKCS7_free(resp);
-
-    attrs = sk_X509_ATTRIBUTE_new_null();
-    attrs = X509at_add1_attr_by_txt(&attrs, PKCS9_COUNTER_SIGNATURE, V_ASN1_SET, p, len);
-    OPENSSL_free(p);
-
     signer_info = PKCS7_get_signer_info(p7);
     if (!signer_info)
         return 1; /* FAILED */
     si = sk_PKCS7_SIGNER_INFO_value(signer_info, 0);
     if (!si)
         return 1; /* FAILED */
-    /*
-     * PKCS7_set_attributes() frees up all elements of si->unauth_attr
-     * and sets there a copy of attrs so overrides the previous timestamp
-     */
-    PKCS7_set_attributes(si, attrs);
-    sk_X509_ATTRIBUTE_pop_free(attrs, X509_ATTRIBUTE_free);
+    if (!X509_attribute_chain_append_object(&(si->unauth_attr), p, len, PKCS9_COUNTER_SIGNATURE)) {
+        OPENSSL_free(p);
+        return 1; /* FAILED */
+    }
+    OPENSSL_free(p);
     return 0; /* OK */
+}
+
+static void print_proxy(char *proxy)
+{
+    if (proxy) {
+        printf ("Using configured proxy: %s\n", proxy);
+    } else {
+        char *http_proxy, *https_proxy;
+
+        http_proxy = getenv("http_proxy");
+        if (!http_proxy)
+            http_proxy = getenv("HTTP_PROXY");
+        if (http_proxy && *http_proxy != '\0')
+            printf ("Using environmental HTTP proxy: %s\n", http_proxy);
+        https_proxy = getenv("https_proxy");
+        if (!https_proxy)
+            https_proxy = getenv("HTTPS_PROXY");
+        if (https_proxy && *https_proxy != '\0')
+            printf ("Using environmental HTTPS proxy: %s\n", https_proxy);
+    }
+}
+
+#if OPENSSL_VERSION_NUMBER<0x30000000L
+#ifdef ENABLE_CURL
+
+static int blob_has_nl = 0;
+
+/*
+ * Callback for writing received data
+ */
+static size_t curl_write(void *ptr, size_t sz, size_t nmemb, void *stream)
+{
+    size_t written, len = sz * nmemb;
+
+    if (len > 0 && !blob_has_nl) {
+        if (memchr(ptr, '\n', len))
+            blob_has_nl = 1;
+    }
+    if (!BIO_write_ex((BIO*)stream, ptr, len, &written) || written != len)
+        return 0; /* FAILED */
+    return written;
 }
 
 /*
  * Get data from HTTP server.
  * [out] http_code: HTTP status
  * [in] url: URL of the CRL distribution point or Time-Stamp Authority HTTP server
- * [in] bout: timestamp request
+ * [in] req: timestamp request
  * [in] proxy: proxy to getting the timestamp through
  * [in] noverifypeer: do not verify the Time-Stamp Authority's SSL certificate
  * [in] verbose: additional output mode
- * [in] content: CRL distribution point (0), RFC3161 TSA (1), Authenticode TSA (2)
- * [returns] pointer to BIO with X509 Certificate Revocation List
+ * [in] rfc3161: Authenticode / RFC3161 Timestamp switch
+ * [returns] pointer to BIO with X509 Certificate Revocation List or timestamp response
  */
-static BIO *bio_get_http(long *http_code, char *url, BIO *bout, char *proxy,
-    int noverifypeer, int verbose, int content)
+static BIO *bio_get_http_curl(long *http_code, char *url, BIO *req, char *proxy,
+    int noverifypeer, int verbose, int rfc3161)
 {
     CURL *curl;
     struct curl_slist *slist = NULL;
@@ -518,6 +589,7 @@ static BIO *bio_get_http(long *http_code, char *url, BIO *bout, char *proxy,
     if (!url) {
         return NULL; /* FAILED */
     }
+    print_proxy(proxy);
     /* Start a libcurl easy session and set options for a curl easy handle */
     printf("Connecting to %s\n", url);
     curl = curl_easy_init();
@@ -553,24 +625,23 @@ static BIO *bio_get_http(long *http_code, char *url, BIO *bout, char *proxy,
             printf("CURL failure: %s %s\n", curl_easy_strerror(res), url);
         }
     }
-    if (content == 1) {
-        /* RFC3161 Timestamp */
-        slist = curl_slist_append(slist, "Content-Type: application/timestamp-query");
-        slist = curl_slist_append(slist, "Accept: application/timestamp-reply");
-    } else if (content == 2) {
-        /* Authenticode Timestamp */
-        slist = curl_slist_append(slist, "Content-Type: application/octet-stream");
-        slist = curl_slist_append(slist, "Accept: application/octet-stream");
-    }
-    if (content > 0) {
-        /* Timestamp */
+    if (req) { /* POST */
+        if (rfc3161) {
+            /* RFC3161 Timestamp */
+            slist = curl_slist_append(slist, "Content-Type: application/timestamp-query");
+            slist = curl_slist_append(slist, "Accept: application/timestamp-reply");
+        } else {
+            /* Authenticode Timestamp */
+            slist = curl_slist_append(slist, "Content-Type: application/octet-stream");
+            slist = curl_slist_append(slist, "Accept: application/octet-stream");
+        }
         slist = curl_slist_append(slist, "User-Agent: Transport");
         slist = curl_slist_append(slist, "Cache-Control: no-cache");
         res = curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
         if (res != CURLE_OK) {
             printf("CURL failure: %s %s\n", curl_easy_strerror(res), url);
         }
-        len = BIO_get_mem_data(bout, &p);
+        len = BIO_get_mem_data(req, &p);
         res = curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, len);
         if (res != CURLE_OK) {
             printf("CURL failure: %s %s\n", curl_easy_strerror(res), url);
@@ -611,11 +682,285 @@ static BIO *bio_get_http(long *http_code, char *url, BIO *bout, char *proxy,
     }
     /* End a libcurl easy handle */
     curl_easy_cleanup(curl);
+    if (req && !rfc3161) {
+        /* BASE64 encoded Authenticode Timestamp */
+        BIO *b64 = BIO_new(BIO_f_base64());
+
+        if (!blob_has_nl)
+            BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+        bin = BIO_push(b64, bin);
+    }
     return bin;
+}
+#endif /* ENABLE_CURL */
+
+#else /* OPENSSL_VERSION_NUMBER<0x30000000L */
+
+/* HTTP callback function that supports TLS connection also via HTTPS proxy */
+static BIO *http_tls_cb(BIO *bio, void *arg, int connect, int detail)
+{
+    HTTP_TLS_Info *info = (HTTP_TLS_Info *)arg;
+    SSL_CTX *ssl_ctx = info->ssl_ctx;
+
+    if (ssl_ctx == NULL) {
+        /* not using TLS */
+        return bio;
+    }
+    if (connect && detail) {
+        /* connecting with TLS */
+        SSL *ssl;
+        BIO *sbio = NULL;
+
+        if (info->use_proxy && !OSSL_HTTP_proxy_connect(bio, info->server,
+            info->port, NULL, NULL, info->timeout, NULL, NULL)) {
+            return NULL;
+        }
+        sbio = BIO_new(BIO_f_ssl());
+        if (sbio == NULL) {
+            return NULL;
+        }
+        ssl = SSL_new(ssl_ctx);
+        if (ssl == NULL) {
+            BIO_free(sbio);
+            return NULL;
+        }
+        SSL_set_tlsext_host_name(ssl, info->server);
+        SSL_set_connect_state(ssl);
+        BIO_set_ssl(sbio, ssl, BIO_CLOSE);
+        bio = BIO_push(sbio, bio);
+    }
+    return bio;
+}
+
+static int verify_callback(int ok, X509_STORE_CTX *ctx)
+{
+    if (!ok) {
+        int error = X509_STORE_CTX_get_error(ctx);
+
+        print_cert(X509_STORE_CTX_get_current_cert(ctx), 0);
+        if (error == X509_V_ERR_UNABLE_TO_GET_CRL) {
+            char *url = clrdp_url_get_x509(X509_STORE_CTX_get_current_cert(ctx));
+
+            printf("\tWarning: Ignoring \'%s\' error for CRL validation\n",
+                X509_verify_cert_error_string(error));
+            printf("\nUse the \"-HTTPS-CRLfile\" option to verify CRL\n");
+            if (url) {
+                printf("HTTPS's CRL distribution point: %s\n", url);
+                OPENSSL_free(url);
+            }
+            return 1;
+        } else {
+            printf("\tError: %s\n", X509_verify_cert_error_string(error));
+        }
+    }
+    return ok;
 }
 
 /*
- * Decode a curl response from BIO and write it into the PKCS7 structure
+ * Read data from socket BIO
+ * [in] s_bio: socket BIO
+ * [in] rctx: open connection context
+ * [in] use_ssl: HTTPS request switch
+ * [returns] memory BIO
+ */
+static BIO *socket_bio_read(BIO *s_bio, OSSL_HTTP_REQ_CTX *rctx, int use_ssl)
+{
+    int retry = 1, ok = 0, written = 0, resp_len = 0;
+    char *buf = OPENSSL_malloc(OSSL_HTTP_DEFAULT_MAX_RESP_LEN);
+    BIO *resp = BIO_new(BIO_s_mem());
+
+    if (rctx) {
+        resp_len = (int)OSSL_HTTP_REQ_CTX_get_resp_len(rctx);
+    }
+    if (resp_len == 0) {
+        if (use_ssl)
+            BIO_ssl_shutdown(s_bio);
+        else {
+            int fd = (int)BIO_get_fd(s_bio, NULL);
+
+            if (fd >= 0) {
+#ifdef WIN32
+                (void)shutdown(fd, SD_SEND);
+#else /* WIN32 */
+                (void)shutdown(fd, SHUT_WR);
+#endif /* WIN32 */
+            }
+        }
+    }
+    ERR_clear_error();
+    while (retry) {
+        int n;
+
+        errno = 0;
+        n = BIO_read(s_bio, buf, OSSL_HTTP_DEFAULT_MAX_RESP_LEN);
+        if (n > 0) {
+            written += BIO_write(resp, buf, n);
+        } else if (BIO_eof(s_bio) == 1) {
+            ok = 1;
+            retry = 0; /* EOF */
+        } else if (BIO_should_retry(s_bio)) {
+        } else {
+            unsigned long err = ERR_get_error();
+
+            if (err == 0) {
+                ok = 1;
+                retry = 0; /* use_ssl EOF */
+            } else {
+                printf("\nHTTP failure: error %ld: %s\n", err, ERR_reason_error_string(err));
+                retry = 0; /* FAILED */
+            }
+        }
+        if (resp_len > 0 && resp_len == written) {
+            ok = 1;
+            retry = 0; /* all response has been read */
+        }
+    }
+    OSSL_HTTP_close(rctx, ok);
+    OPENSSL_free(buf);
+    if (!ok) {
+        BIO_free_all(resp);
+        resp = NULL;
+    }
+
+    return resp;
+}
+
+/*
+ * pkcs7-signedData bytes found indicates DER form
+ * in otherwise BASE64 encoded
+ * '\n' newline character means BASE64 line with newline at the end
+ * in otherwise BIO_FLAGS_BASE64_NO_NL flag must me set
+ * [in, out] resp: memory BIO with Authenticode Timestamp data
+ * [returns] none
+ */
+static void check_authenticode_timestamp(BIO **resp)
+{
+    u_char *ptr = NULL;
+    const u_char pkcs7_signed[] = {0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02};
+    int i, len, pkcs7_signed_len, found = 0;
+
+    len = (int)BIO_get_mem_data(*resp, &ptr);
+    if (len <= 0) {
+        return;
+    }
+    pkcs7_signed_len = (int)sizeof pkcs7_signed;
+    for (i = 0; i <= len - pkcs7_signed_len; i++) {
+        if (memcmp(ptr + i, pkcs7_signed, (size_t)pkcs7_signed_len) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        /* BASE64 encoded Authenticode Timestamp */
+        BIO *b64 = BIO_new(BIO_f_base64());
+
+        if (!memchr(ptr, '\n', (size_t)len)) {
+            BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+        } else {
+            BIO *bio_mem = BIO_new_mem_buf(ptr, len);
+            BIO_push(b64, bio_mem);
+        }
+        *resp = BIO_push(b64, *resp);
+    }
+}
+
+/*
+ * Get data from HTTP server.
+ * [in] url: URL of the CRL distribution point or Time-Stamp Authority HTTP server
+ * [in] req: timestamp request
+ * [in] proxy: proxy to getting the timestamp through
+ * [in] rfc3161: Authenticode / RFC3161 Timestamp switch
+ * [in] cafile: file contains concatenated CA certificates in PEM format
+ * [in] crlfile: file contains Certificate Revocation List (CRLs)
+ * [returns] pointer to BIO with X509 Certificate Revocation List or timestamp response
+ */
+static BIO *bio_get_http(char *url, BIO *req, char *proxy, int rfc3161, char *cafile, char *crlfile)
+{
+    BIO *tmp_bio = NULL, *s_bio = NULL, *resp = NULL;
+    OSSL_HTTP_REQ_CTX *rctx = NULL;
+    HTTP_TLS_Info info;
+    SSL_CTX *ssl_ctx = NULL;
+    char *server = NULL, *port = NULL, *path = NULL;
+    int timeout = -1; /* blocking mode, exactly one try, see BIO_do_connect_retry() */
+    int keep_alive = 1; /* prefer */
+    int use_ssl = 0;
+
+    if (!url) {
+        return NULL; /* FAILED */
+    }
+    print_proxy(proxy);
+    printf("Connecting to %s\n", url);
+
+    if (!OSSL_HTTP_parse_url(url, &use_ssl, NULL, &server, &port, NULL, &path, NULL, NULL)) {
+        return NULL; /* FAILED */
+    }
+    if (use_ssl) {
+        X509_STORE *store = NULL;
+
+        ssl_ctx = SSL_CTX_new(TLS_client_method());
+        if (cafile) {
+            printf("HTTPS-CAfile: %s\n", cafile);
+            if (crlfile)
+                printf("HTTPS-CRLfile: %s\n", crlfile);
+            store = SSL_CTX_get_cert_store(ssl_ctx);
+            if (x509_store_load_crlfile(store, cafile, crlfile))
+                SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, verify_callback);
+            else
+                printf("Warning: HTTPS verification was skipped\n");
+        } else {
+            printf("Warning: HTTPS verification was skipped\n");
+        }
+    }
+    info.server = server;
+    info.port = port;
+    info.use_proxy = OSSL_HTTP_adapt_proxy(proxy, NULL, server, use_ssl) != NULL;
+    info.timeout = timeout;
+    info.ssl_ctx = ssl_ctx;
+
+    if (!req) { /* GET */
+        const char *expected_content_type = "application/pkix-crl";
+
+        s_bio = OSSL_HTTP_get(url, proxy, NULL, NULL, NULL, http_tls_cb, &info, 0,
+            NULL, expected_content_type, 0, 0, timeout);
+    } else { /* POST */
+        const char *content_type = "application/timestamp-query"; /* RFC3161 Timestamp */
+        const char *expected_content_type = "application/timestamp-reply";
+
+        if (!rfc3161) {
+            u_char *p = NULL;
+            long len = BIO_get_mem_data(req, &p);
+
+            tmp_bio = BIO_new(BIO_s_mem());
+            BIO_write(tmp_bio, p, (int)len);
+            req = BIO_push(tmp_bio, req);
+            content_type = "application/octet-stream"; /* Authenticode Timestamp */
+            expected_content_type = "application/octet-stream";
+        }
+        s_bio = OSSL_HTTP_transfer(&rctx, server, port, path, use_ssl, proxy, NULL,
+            NULL, NULL, http_tls_cb, &info, 0, NULL, content_type, req,
+            expected_content_type, 0, 0, timeout, keep_alive);
+        BIO_free(tmp_bio);
+    }
+    OPENSSL_free(server);
+    OPENSSL_free(port);
+    OPENSSL_free(path);
+    SSL_CTX_free(ssl_ctx);
+
+    if (s_bio) {
+        resp = socket_bio_read(s_bio, rctx, use_ssl);
+        BIO_free_all(s_bio);
+        if (resp && req && !rfc3161)
+            check_authenticode_timestamp(&resp);
+    } else {
+        printf("\nHTTP failure: Failed to get data from %s\n", url);
+    }
+
+    return resp;
+}
+#endif /* OPENSSL_VERSION_NUMBER<0x30000000L */
+
+/*
+ * Decode a HTTP response from BIO and write it into the PKCS7 structure
  * Add timestamp to the PKCS7 SignerInfo structure:
  * sig->d.sign->signer_info->unauth_attr
  * [in, out] p7: new PKCS#7 signature
@@ -626,61 +971,78 @@ static BIO *bio_get_http(long *http_code, char *url, BIO *bout, char *proxy,
  */
 static int add_timestamp(PKCS7 *p7, FILE_FORMAT_CTX *ctx, char *url, int rfc3161)
 {
-    BIO *bout, *bin;
+    BIO *req, *resp;
     int verbose = ctx->options->verbose || ctx->options->ntsurl == 1;
     int res = 1;
+#if OPENSSL_VERSION_NUMBER<0x30000000L
+#ifdef ENABLE_CURL
     long http_code = -1;
+#endif /* ENABLE_CURL */
+#endif /* OPENSSL_VERSION_NUMBER<0x30000000L */
 
     /* Encode timestamp request */
     if (rfc3161) {
-        bout = bio_encode_rfc3161_request(p7, ctx->options->md);
+        req = bio_encode_rfc3161_request(p7, ctx->options->md);
     } else {
-        bout = bio_encode_authenticode_request(p7);
+        req = bio_encode_authenticode_request(p7);
     }
-    if (!bout) {
+    if (!req) {
         return 1; /* FAILED */
     }
+#if OPENSSL_VERSION_NUMBER<0x30000000L
+#ifndef ENABLE_CURL
+    (void)url;
+    (void)rfc3161;
+    printf("Could NOT find CURL\n");
+    BIO_free_all(req);
+    return NULL; /* FAILED */
+#else /* ENABLE_CURL */
     if (rfc3161) {
-        bin = bio_get_http(&http_code, url, bout, ctx->options->proxy,
+        resp = bio_get_http_curl(&http_code, url, req, ctx->options->proxy,
             ctx->options->noverifypeer, verbose, 1);
     } else {
-        bin = bio_get_http(&http_code, url, bout, ctx->options->proxy,
-            ctx->options->noverifypeer, verbose, 2);
+        resp = bio_get_http_curl(&http_code, url, req, ctx->options->proxy,
+            ctx->options->noverifypeer, verbose, 0);
     }
-    BIO_free_all(bout);
-
-    if (bin) {
+#endif /* ENABLE_CURL */
+#else /* OPENSSL_VERSION_NUMBER<0x30000000L */
+    if (rfc3161) {
+        resp = bio_get_http(url, req, ctx->options->proxy, 1,
+            ctx->options->noverifypeer ? NULL : ctx->options->https_cafile,
+            ctx->options->noverifypeer ? NULL : ctx->options->https_crlfile);
+    } else {
+        resp = bio_get_http(url, req, ctx->options->proxy, 0,
+            ctx->options->noverifypeer ? NULL : ctx->options->https_cafile,
+            ctx->options->noverifypeer ? NULL : ctx->options->https_crlfile);
+    }
+#endif /* OPENSSL_VERSION_NUMBER<0x30000000L */
+    BIO_free_all(req);
+    if (resp != NULL) {
         if (rfc3161) {
             /* decode a RFC 3161 response from BIO */
-            TS_RESP *response = d2i_TS_RESP_bio(bin, NULL);
-            BIO_free_all(bin);
+            TS_RESP *response = d2i_TS_RESP_bio(resp, NULL);
 
             res = attach_rfc3161_response(p7, response, verbose);
             TS_RESP_free(response);
         } else {
             /* decode an authenticode response from BIO */
-            PKCS7 *response;
-            BIO *b64, *b64_bin;
-
-            b64 = BIO_new(BIO_f_base64());
-            if (!blob_has_nl)
-                BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-            b64_bin = BIO_push(b64, bin);
-            response = d2i_PKCS7_bio(b64_bin, NULL);
-            BIO_free_all(b64_bin);
+            PKCS7 *response = d2i_PKCS7_bio(resp, NULL);
 
             res = attach_authenticode_response(p7, response, verbose);
         }
         if (res && verbose) {
-            if (http_code != -1) {
+#if OPENSSL_VERSION_NUMBER<0x30000000L
+#ifdef ENABLE_CURL
+            if (http_code != -1)
                 printf("Failed to convert timestamp reply from %s; "
                 "HTTP status %ld\n", url, http_code);
-            } else {
-                printf("Failed to convert timestamp reply from %s; "
-                "no HTTP status available", url);
-            }
+            else
+#endif /* ENABLE_CURL */
+#endif /* OPENSSL_VERSION_NUMBER<0x30000000L */
+                printf("Failed to convert timestamp reply from %s\n", url);
             ERR_print_errors_fp(stdout);
         }
+        BIO_free_all(resp);
     }
     return res;
 }
@@ -714,7 +1076,6 @@ static int add_timestamp_rfc3161(PKCS7 *p7, FILE_FORMAT_CTX *ctx)
     }
     return 0; /* FAILED */
 }
-#endif /* ENABLE_CURL */
 
 /*
  * [in] resp_ctx: a response context that can be used for generating responses
@@ -952,7 +1313,7 @@ out:
 
 /*
  * If successful the unauthenticated blob will be written into
- * the PKCS7 SignerInfo structure as an unauthorized attribute - cont[1]:
+ * the PKCS7 SignerInfo structure as an unauthenticated attribute - cont[1]:
  * p7->d.sign->signer_info->unauth_attr
  * [in, out] p7: new PKCS#7 signature
  * [returns] 0 on error or 1 on success
@@ -961,16 +1322,17 @@ static int add_unauthenticated_blob(PKCS7 *p7)
 {
     PKCS7_SIGNER_INFO *si;
     STACK_OF(PKCS7_SIGNER_INFO) *signer_info;
-    ASN1_STRING *astr;
     u_char *p = NULL;
-    int nid, len = 1024+4;
+    int len = 1024+4;
     /* Length data for ASN1 attribute plus prefix */
     const char prefix[] = "\x0c\x82\x04\x00---BEGIN_BLOB---";
     const char postfix[] = "---END_BLOB---";
 
     signer_info = PKCS7_get_signer_info(p7);
-    if (!signer_info)
+    if (!signer_info) {
+        printf("Failed to obtain PKCS#7 signer info list\n");
         return 0; /* FAILED */
+    }
     si = sk_PKCS7_SIGNER_INFO_value(p7->d.sign->signer_info, 0);
     if (!si)
         return 0; /* FAILED */
@@ -979,23 +1341,22 @@ static int add_unauthenticated_blob(PKCS7 *p7)
     memset(p, 0, (size_t)len);
     memcpy(p, prefix, sizeof prefix);
     memcpy(p + len - sizeof postfix, postfix, sizeof postfix);
-    astr = ASN1_STRING_new();
-    ASN1_STRING_set(astr, p, len);
-    nid = OBJ_create(SPC_UNAUTHENTICATED_DATA_BLOB_OBJID,
-        "unauthenticatedData", "unauthenticatedData");
-    PKCS7_add_attribute(si, nid, V_ASN1_SEQUENCE, astr);
+    if (!X509_attribute_chain_append_object(&(si->unauth_attr), p, len, SPC_UNAUTHENTICATED_DATA_BLOB_OBJID)) {
+        OPENSSL_free(p);
+        return 1; /* FAILED */
+    }
     OPENSSL_free(p);
     return 1; /* OK */
 }
 
 /*
+ * Add unauthenticated attributes (Countersignature, Unauthenticated Data Blob)
  * [in, out] p7: new PKCS#7 signature
  * [in, out] ctx: structure holds input and output data
  * [returns] 1 on error or 0 on success
  */
 static int add_timestamp_and_blob(PKCS7 *p7, FILE_FORMAT_CTX *ctx)
 {
-#ifdef ENABLE_CURL
     /* add counter-signature/timestamp */
     if (ctx->options->nturl && !add_timestamp_authenticode(p7, ctx)) {
         printf("%s\n%s\n", "Authenticode timestamping failed",
@@ -1011,7 +1372,6 @@ static int add_timestamp_and_blob(PKCS7 *p7, FILE_FORMAT_CTX *ctx)
         printf("Built-in timestamping failed\n");
         return 1; /* FAILED */
     }
-#endif /* ENABLE_CURL */
     if (ctx->options->addBlob && !add_unauthenticated_blob(p7)) {
         printf("Adding unauthenticated blob failed\n");
         return 1; /* FAILED */
@@ -1020,52 +1380,83 @@ static int add_timestamp_and_blob(PKCS7 *p7, FILE_FORMAT_CTX *ctx)
 }
 
 /*
- * [in, out] unauth_attr: unauthorized attributes list
- * [in] p: PKCS#7 data
- * [in] len: PKCS#7 data length
- * [returns] 0 on error or 1 on success
+ * Add unauthenticated attributes to the signature at a certain position
+ * [in, out] p7: new PKCS#7 signature
+ * [in, out] ctx: structure holds input and output data
+ * [in] index: signature index
+ * [returns] 1 on error or 0 on success
  */
-static int X509_attribute_chain_append_signature(STACK_OF(X509_ATTRIBUTE) **unauth_attr, u_char *p, int len)
+static int add_nested_timestamp_and_blob(PKCS7 *p7, FILE_FORMAT_CTX *ctx, int index)
 {
-    X509_ATTRIBUTE *attr = NULL;
-    int nid = OBJ_txt2nid(SPC_NESTED_SIGNATURE_OBJID);
+    STACK_OF(PKCS7) *signatures;
+    STACK_OF(PKCS7_SIGNER_INFO) *signer_info;
+    STACK_OF(X509_ATTRIBUTE) *unauth_attr;
+    PKCS7_SIGNER_INFO *si;
+    PKCS7 *p7_tmp;
+    int i;
 
-    if (*unauth_attr == NULL) {
-        if ((*unauth_attr = sk_X509_ATTRIBUTE_new_null()) == NULL)
-            return 0; /* FAILED */
-    } else {
-        /* try to find SPC_NESTED_SIGNATURE_OBJID attribute */
-        int i;
-        for (i = 0; i < sk_X509_ATTRIBUTE_num(*unauth_attr); i++) {
-            attr = sk_X509_ATTRIBUTE_value(*unauth_attr, i);
+    p7_tmp = PKCS7_dup(p7);
+    if (!p7_tmp) {
+        return 1; /* FAILED */
+    }
+    signer_info = PKCS7_get_signer_info(p7);
+    if (!signer_info) {
+        printf("Failed to obtain PKCS#7 signer info list\n");
+        return 1; /* FAILED */
+    }
+    si = sk_PKCS7_SIGNER_INFO_value(signer_info, 0);
+    if (!si) {
+        printf("Failed to obtain PKCS#7 signer info value\n");
+        return 1; /* FAILED */
+    }
+    unauth_attr = PKCS7_get_attributes(si); /* cont[1] */
+    if (unauth_attr) {
+        /* try to find and remove SPC_NESTED_SIGNATURE_OBJID attribute */
+        for (i=0; i<X509at_get_attr_count(unauth_attr); i++) {
+            int nid = OBJ_txt2nid(SPC_NESTED_SIGNATURE_OBJID);
+            X509_ATTRIBUTE *attr = X509at_get_attr(unauth_attr, i);
             if (OBJ_obj2nid(X509_ATTRIBUTE_get0_object(attr)) == nid) {
-                /* append p to the V_ASN1_SEQUENCE */
-                if (!X509_ATTRIBUTE_set1_data(attr, V_ASN1_SEQUENCE, p, len))
-                    return 0; /* FAILED */
-                return 1; /* OK */
+                X509at_delete_attr(unauth_attr, i);
+                X509_ATTRIBUTE_free(attr);
+                break;
             }
         }
     }
-    /* create new unauthorized SPC_NESTED_SIGNATURE_OBJID attribute */
-    attr = X509_ATTRIBUTE_create_by_NID(NULL, nid, V_ASN1_SEQUENCE, p, len);
-    if (!attr)
-        return 0; /* FAILED */
-    if (!sk_X509_ATTRIBUTE_push(*unauth_attr, attr)) {
-        X509_ATTRIBUTE_free(attr);
-        return 0; /* FAILED */
+    signatures = signature_list_create(p7_tmp);
+    if (!signatures) {
+        printf("Failed to create signature list\n\n");
+        return 1; /* FAILED */
     }
-    return 1; /* OK */
+    /* append all nested signature to the primary signature */
+    for (i=1; i<sk_PKCS7_num(signatures); i++) {
+        PKCS7 *sig = sk_PKCS7_value(signatures, i);
+        if (i == index) {
+            printf("Use the signature at index %d\n", i);
+            if (add_timestamp_and_blob(sig, ctx)) {
+                printf("Unable to set unauthenticated attributes\n");
+                sk_PKCS7_pop_free(signatures, PKCS7_free);
+                return 1; /* FAILED */
+            }
+        }
+        if (!cursig_set_nested(p7, sig)) {
+            printf("Unable to append the nested signature to the current signature\n");
+            sk_PKCS7_pop_free(signatures, PKCS7_free);
+            return 1; /* FAILED */
+        }
+    }
+    sk_PKCS7_pop_free(signatures, PKCS7_free);
+    return 0; /* OK */
 }
 
 /*
  * Add the new signature to the current signature as a nested signature:
- * new unauthorized SPC_NESTED_SIGNATURE_OBJID attribute
+ * new unauthenticated SPC_NESTED_SIGNATURE_OBJID attribute
  * [out] cursig: current PKCS#7 signature
  * [in] p7: new PKCS#7 signature
  * [in] ctx: structure holds input and output data
  * [returns] 0 on error or 1 on success
  */
-static int cursig_set_nested(PKCS7 *cursig, PKCS7 *p7, FILE_FORMAT_CTX *ctx)
+static int cursig_set_nested(PKCS7 *cursig, PKCS7 *p7)
 {
     u_char *p = NULL;
     int len = 0;
@@ -1085,15 +1476,100 @@ static int cursig_set_nested(PKCS7 *cursig, PKCS7 *p7, FILE_FORMAT_CTX *ctx)
         return 0; /* FAILED */
     i2d_PKCS7(p7, &p);
     p -= len;
-
-    pkcs7_signer_info_add_signing_time(si, ctx);
-    if (!X509_attribute_chain_append_signature(&(si->unauth_attr), p, len)) {
+    if (!X509_attribute_chain_append_object(&(si->unauth_attr), p, len, SPC_NESTED_SIGNATURE_OBJID)) {
         OPENSSL_free(p);
         return 0; /* FAILED */
     }
     OPENSSL_free(p);
     return 1; /* OK */
 }
+
+/*
+ * Return the number of objects in SPC_NESTED_SIGNATURE_OBJID attribute
+ * [in] p7: existing PKCS#7 signature (Primary Signature)
+ * [returns] -1 on error or the number of nested signatures
+ */
+static int nested_signatures_number_get(PKCS7 *p7)
+{
+    int i;
+    STACK_OF(X509_ATTRIBUTE) *unauth_attr;
+    PKCS7_SIGNER_INFO *si;
+    STACK_OF(PKCS7_SIGNER_INFO) *signer_info = PKCS7_get_signer_info(p7);
+
+    if (!signer_info)
+        return -1; /* FAILED */
+    si = sk_PKCS7_SIGNER_INFO_value(signer_info, 0);
+    if (!si)
+        return -1; /* FAILED */
+    unauth_attr = PKCS7_get_attributes(si); /* cont[1] */
+    if (!unauth_attr)
+        return 0; /* OK, no unauthenticated attributes */
+    for (i=0; i<X509at_get_attr_count(unauth_attr); i++) {
+        int nid = OBJ_txt2nid(SPC_NESTED_SIGNATURE_OBJID);
+        X509_ATTRIBUTE *attr = X509at_get_attr(unauth_attr, i);
+        if (OBJ_obj2nid(X509_ATTRIBUTE_get0_object(attr)) == nid) {
+            /* Nested Signature - Policy OID: 1.3.6.1.4.1.311.2.4.1 */
+            return X509_ATTRIBUTE_count(attr);
+        }
+    }
+    return 0; /* OK, no SPC_NESTED_SIGNATURE_OBJID attribute */
+}
+
+/*
+ * [in, out] unauth_attr: unauthenticated attributes list
+ * [in] p: PKCS#7 data
+ * [in] len: PKCS#7 data length
+ * [in] oid: unauthenticated attribute oid: SPC_UNAUTHENTICATED_DATA_BLOB_OBJID,
+        PKCS9_COUNTER_SIGNATURE, SPC_RFC3161_OBJID or SPC_NESTED_SIGNATURE_OBJID
+ * [returns] 0 on error or 1 on success
+ */
+static int X509_attribute_chain_append_object(STACK_OF(X509_ATTRIBUTE) **unauth_attr,
+    u_char *p, int len, const char *oid)
+{
+    X509_ATTRIBUTE *attr = NULL;
+    ASN1_OBJECT *object;
+    char object_txt[128];
+
+    if (*unauth_attr == NULL) {
+        if ((*unauth_attr = sk_X509_ATTRIBUTE_new_null()) == NULL)
+            return 0; /* FAILED */
+    } else {
+        /* try to find indicated unauthenticated attribute */
+        int i;
+        for (i = 0; i < X509at_get_attr_count(*unauth_attr); i++) {
+            attr = X509at_get_attr(*unauth_attr, i);
+            object = X509_ATTRIBUTE_get0_object(attr);
+            if (object == NULL)
+                continue;
+            object_txt[0] = 0x00;
+            OBJ_obj2txt(object_txt, sizeof object_txt, object, 1);
+            if ((!strcmp(oid, PKCS9_COUNTER_SIGNATURE) || !strcmp(oid, SPC_RFC3161_OBJID))
+                && (!strcmp(object_txt, PKCS9_COUNTER_SIGNATURE) || !strcmp(object_txt, SPC_RFC3161_OBJID))) {
+                /* free up countersignature/timestamp in unauthenticated attributes
+                 * to override the previous timestamp */
+                X509at_delete_attr(*unauth_attr, i);
+                X509_ATTRIBUTE_free(attr);
+                continue;
+            }
+            if (!strcmp(oid, object_txt)) {
+                /* append p to the V_ASN1_SEQUENCE */
+                if (!X509_ATTRIBUTE_set1_data(attr, V_ASN1_SEQUENCE, p, len))
+                    return 0; /* FAILED */
+                return 1; /* OK */
+            }
+        }
+    }
+    /* create new unauthenticated attribute */
+    attr = X509_ATTRIBUTE_create_by_NID(NULL, OBJ_txt2nid(oid), V_ASN1_SEQUENCE, p, len);
+    if (!attr)
+        return 0; /* FAILED */
+    if (!sk_X509_ATTRIBUTE_push(*unauth_attr, attr)) {
+        X509_ATTRIBUTE_free(attr);
+        return 0; /* FAILED */
+    }
+    return 1; /* OK */
+}
+
 
 /*
  * [in, out] store: structure for holding information about X.509 certificates and CRLs
@@ -1169,6 +1645,8 @@ static void print_cert(X509 *cert, int i)
     char *subject, *issuer, *serial;
     BIGNUM *serialbn;
 
+    if (!cert)
+        return;
     subject = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
     issuer = X509_NAME_oneline(X509_get_issuer_name(cert), NULL, 0);
     serialbn = ASN1_INTEGER_to_BN(X509_get_serialNumber(cert), NULL);
@@ -1186,6 +1664,19 @@ static void print_cert(X509 *cert, int i)
     OPENSSL_free(issuer);
     BN_free(serialbn);
     OPENSSL_free(serial);
+}
+
+/*
+ * [in] certs: X509 certificate chain
+ * [returns] none
+ */
+static void print_certs_chain(STACK_OF(X509) *certs)
+{
+    int i;
+
+    for (i=0; i<sk_X509_num(certs); i++) {
+        print_cert(sk_X509_value(certs, i), i);
+    }
 }
 
 /*
@@ -1241,7 +1732,7 @@ static int trusted_cert(X509 *cert, int error) {
         return 0; /* FAILED */
     }
     if (on_list(hex, fingerprints)) {
-        printf("\tWarning: Ignoring %s error for Windows certificate whitelist\n",
+        printf("\tWarning: Ignoring \'%s\' error for Windows certificate whitelist\n",
             X509_verify_cert_error_string(error));
         OPENSSL_free(hex);
         return 1; /* trusted */
@@ -1263,6 +1754,9 @@ static int verify_ca_callback(int ok, X509_STORE_CTX *ctx)
     if (!ok) {
         if (trusted_cert(current_cert, error)) {
             return 1;
+        } else if (error == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN) {
+            printf("\tError: Certificate not found in local repository: %s\n",
+                X509_verify_cert_error_string(error));
         } else {
             printf("\tError: %s\n", X509_verify_cert_error_string(error));
         }
@@ -1281,10 +1775,14 @@ static int verify_crl_callback(int ok, X509_STORE_CTX *ctx)
         if (trusted_cert(current_cert, error)) {
             return 1;
         } else if (error == X509_V_ERR_CERT_HAS_EXPIRED) {
-            printf("\tWarning: Ignoring %s error for CRL validation\n",
+            printf("\tWarning: Ignoring \'%s\' error for CRL validation\n",
                 X509_verify_cert_error_string(error));
             return 1;
-        } else {
+        } else if (error == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN) {
+            printf("\tError: Certificate not found in local repository: %s\n",
+                X509_verify_cert_error_string(error));
+        }
+         else {
             printf("\tError: %s\n", X509_verify_cert_error_string(error));
         }
     }
@@ -1304,7 +1802,7 @@ static int x509_store_load_file(X509_STORE *store, char *cafile)
     lookup = X509_STORE_add_lookup(store, X509_LOOKUP_file());
     if (!lookup || !cafile)
         return 0; /* FAILED */
-    if (!X509_load_cert_file(lookup, cafile, X509_FILETYPE_PEM)) {
+    if (!X509_LOOKUP_load_file(lookup, cafile, X509_FILETYPE_PEM)) {
         printf("\nError: no certificate found\n");
         return 0; /* FAILED */
     }
@@ -1334,7 +1832,7 @@ static int x509_store_load_crlfile(X509_STORE *store, char *cafile, char *crlfil
     lookup = X509_STORE_add_lookup(store, X509_LOOKUP_file());
     if (!lookup)
         return 0; /* FAILED */
-    if (!X509_load_cert_file(lookup, cafile, X509_FILETYPE_PEM)) {
+    if (!X509_LOOKUP_load_file(lookup, cafile, X509_FILETYPE_PEM)) {
         printf("\nError: no certificate found\n");
         return 0; /* FAILED */
     }
@@ -1389,7 +1887,7 @@ static int verify_crl(char *cafile, char *crlfile, STACK_OF(X509_CRL) *crls,
     if (crls)
         X509_STORE_CTX_set0_crls(ctx, crls);
 
-    printf("\nCertificate Revocation List verified by:\n");
+    printf("\nCertificate Revocation List verified using:\n");
     if (X509_verify_cert(ctx) <= 0) {
         int error = X509_STORE_CTX_get_error(ctx);
         printf("\nX509_verify_cert: certificate verify error: %s\n",
@@ -1450,21 +1948,37 @@ out:
 /*
  * Get Certificate Revocation List from a CRL distribution point
  * and write it into the X509_CRL structure.
+ * [in] ctx: structure holds input and output data
  * [in] url: URL of the CRL distribution point server
  * [returns] X509 Certificate Revocation List
  */
-static X509_CRL *x509_crl_get(char *url)
+static X509_CRL *x509_crl_get(FILE_FORMAT_CTX *ctx, char *url)
 {
     X509_CRL *crl;
-    BIO *bio;
-    long http_code = -1;
+    BIO *bio = NULL;
 
-    bio = bio_get_http(&http_code, url, NULL, NULL, 0, 1, 0);
+#if OPENSSL_VERSION_NUMBER<0x30000000L
+#ifndef ENABLE_CURL
+    printf("Could NOT find CURL\n");
+    return NULL; /* FAILED */
+#else /* ENABLE_CURL */
+    long http_code = -1;
+    bio = bio_get_http_curl(&http_code, url, NULL, ctx->options->proxy, 0, 1, 0);
+#endif /* ENABLE_CURL */
+#else /* OPENSSL_VERSION_NUMBER<0x30000000L */
+    bio = bio_get_http(url, NULL, ctx->options->proxy, 0,
+        ctx->options->noverifypeer ? NULL : ctx->options->https_cafile,
+        ctx->options->noverifypeer ? NULL : ctx->options->https_crlfile);
+#endif /* OPENSSL_VERSION_NUMBER<0x30000000L */
     if (!bio) {
         printf("Warning: Faild to get CRL from %s\n\n", url);
         return NULL; /* FAILED */
     }
-    crl = d2i_X509_CRL_bio(bio, NULL);
+    crl = d2i_X509_CRL_bio(bio, NULL);  /* DER format */
+    if (!crl) {
+        (void)BIO_seek(bio, 0);
+        crl = PEM_read_bio_X509_CRL(bio, NULL, NULL, NULL); /* PEM format */
+    }
     BIO_free_all(bio);
     if (!crl) {
          printf("Warning: Faild to decode CRL from %s\n\n", url);
@@ -1631,10 +2145,16 @@ static int verify_timestamp(FILE_FORMAT_CTX *ctx, PKCS7 *p7, CMS_ContentInfo *ti
     }
 
     /* verify a CMS SignedData structure */
-    printf("\nTimestamp verified by:\n");
+    printf("\nTimestamp verified using:\n");
     if (!CMS_verify(timestamp, NULL, store, 0, NULL, 0)) {
+        STACK_OF(X509) *cms_certs;
+
         printf("\nCMS_verify error\n");
         X509_STORE_free(store);
+        printf("\nFailed timestamp certificate chain retrieved from the signature:\n");
+        cms_certs = CMS_get1_certs(timestamp);
+        print_certs_chain(cms_certs);
+        sk_X509_pop_free(cms_certs, X509_free);
         goto out;
     }
     X509_STORE_free(store);
@@ -1645,16 +2165,19 @@ static int verify_timestamp(FILE_FORMAT_CTX *ctx, PKCS7 *p7, CMS_ContentInfo *ti
 
     /* verify a Certificate Revocation List */
     url = clrdp_url_get_x509(signer);
-#ifdef ENABLE_CURL
     if (url) {
-        printf("TSA's CRL distribution point: %s\n", url);
-        crl = x509_crl_get(url);
+        if (ctx->options->ignore_cdp) {
+            printf("Ignored TSA's CRL distribution point: %s\n", url);
+        } else {
+            printf("TSA's CRL distribution point: %s\n", url);
+            crl = x509_crl_get(ctx, url);
+        }
         OPENSSL_free(url);
         if (!crl && !ctx->options->tsa_crlfile) {
             printf("Use the \"-TSA-CRLfile\" option to add one or more Time-Stamp Authority CRLs in PEM format.\n");
+            goto out;
         }
     }
-#endif /* ENABLE_CURL */
     if (p7->d.sign->crl || crl) {
         crls = x509_crl_list_get(p7, crl);
         if (!crls) {
@@ -1690,6 +2213,28 @@ out:
     return verok;
 }
 
+#if OPENSSL_VERSION_NUMBER<0x30000000L
+static int PKCS7_type_is_other(PKCS7 *p7)
+{
+    int isOther = 1;
+    int nid = OBJ_obj2nid(p7->type);
+
+    switch (nid) {
+    case NID_pkcs7_data:
+    case NID_pkcs7_signed:
+    case NID_pkcs7_enveloped:
+    case NID_pkcs7_signedAndEnveloped:
+    case NID_pkcs7_digest:
+    case NID_pkcs7_encrypted:
+        isOther = 0;
+        break;
+    default:
+        isOther = 1;
+    }
+    return isOther;
+}
+#endif /* OPENSSL_VERSION_NUMBER<0x30000000L */
+
 /*
  * [in] ctx: structure holds input and output data
  * [in] p7: PKCS#7 signature
@@ -1705,6 +2250,7 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
     BIO *bio = NULL;
     int verok = 0;
     char *url;
+    PKCS7 *contents = p7->d.sign->contents;
 
     store = X509_STORE_new();
     if (!store)
@@ -1733,19 +2279,34 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
         }
     }
     /* verify a PKCS#7 signedData structure */
-    if (p7->d.sign->contents->d.other->type == V_ASN1_SEQUENCE) {
-        /* only verify the contents of the sequence */
-        int seqhdrlen;
-        seqhdrlen = asn1_simple_hdr_len(p7->d.sign->contents->d.other->value.sequence->data,
-            p7->d.sign->contents->d.other->value.sequence->length);
-        bio = BIO_new_mem_buf(p7->d.sign->contents->d.other->value.sequence->data + seqhdrlen,
-            p7->d.sign->contents->d.other->value.sequence->length - seqhdrlen);
+    if (PKCS7_type_is_other(contents) && (contents->d.other != NULL)
+        && (contents->d.other->value.sequence != NULL)
+        && (contents->d.other->value.sequence->length > 0)) {
+        if (contents->d.other->type == V_ASN1_SEQUENCE) {
+            /* only verify the content of the sequence */
+            const unsigned char *data = contents->d.other->value.sequence->data;
+            long len;
+            int inf, tag, class;
+
+            inf = ASN1_get_object(&data, &len, &tag, &class,
+                contents->d.other->value.sequence->length);
+            if (inf != V_ASN1_CONSTRUCTED || tag != V_ASN1_SEQUENCE) {
+                printf("Corrupted data content\n");
+                X509_STORE_free(store);
+                goto out;
+            }
+            bio = BIO_new_mem_buf(data, (int)len);
+        } else {
+            /* verify the entire value */
+            bio = BIO_new_mem_buf(contents->d.other->value.sequence->data,
+                contents->d.other->value.sequence->length);
+        }
     } else {
-        /* verify the entire value */
-        bio = BIO_new_mem_buf(p7->d.sign->contents->d.other->value.sequence->data,
-            p7->d.sign->contents->d.other->value.sequence->length);
+        printf("Corrupted data content\n");
+        X509_STORE_free(store);
+        goto out;
     }
-    printf("Signing Certificate Chain:\n");
+    printf("Signing certificate chain verified using:\n");
     /*
      * In the PKCS7_verify() function, the BIO *indata parameter refers to
      * the signed data if the content is detached from p7.
@@ -1757,6 +2318,8 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
         printf("\nPKCS7_verify error\n");
         X509_STORE_free(store);
         BIO_free(bio);
+        printf("\nFailed signing certificate chain retrieved from the signature:\n");
+        print_certs_chain(p7->d.sign->cert);
         goto out;
     }
     X509_STORE_free(store);
@@ -1764,17 +2327,19 @@ static int verify_authenticode(FILE_FORMAT_CTX *ctx, PKCS7 *p7, time_t time, X50
 
     /* verify a Certificate Revocation List */
     url = clrdp_url_get_x509(signer);
-#ifdef ENABLE_CURL
     if (url) {
-        printf("CRL distribution point: %s\n", url);
-        crl = x509_crl_get(url);
+        if (ctx->options->ignore_cdp) {
+            printf("Ignored CRL distribution point: %s\n", url);
+        } else {
+            printf("CRL distribution point: %s\n", url);
+            crl = x509_crl_get(ctx, url);
+        }
         OPENSSL_free(url);
         if (!crl && !ctx->options->crlfile) {
             printf("Use the \"-CRLfile\" option to add one or more CRLs in PEM format.\n");
             goto out;
         }
     }
-#endif /* ENABLE_CURL */
     if (p7->d.sign->crl || crl) {
         crls = x509_crl_list_get(p7, crl);
         if (!crls) {
@@ -1904,8 +2469,6 @@ static int print_cms_timestamp(CMS_ContentInfo *timestamp, time_t time)
 
     /* PKCS#9 signing time - Policy OID: 1.2.840.113549.1.9.5 */
     attr = CMS_signed_get_attr(si, CMS_signed_get_attr_by_NID(si, NID_pkcs9_signingTime, -1));
-    if (attr == NULL)
-        return 0; /* FAILED */
     printf("\tSigning time: ");
     print_time_t(time_t_get_asn1_time(X509_ATTRIBUTE_get0_data(attr, 0, V_ASN1_UTCTIME, NULL)));
 
@@ -1956,8 +2519,10 @@ static time_t time_t_timestamp_get_attributes(CMS_ContentInfo **timestamp, PKCS7
     md_nid = OBJ_obj2nid(si->digest_alg->algorithm);
     printf("Message digest algorithm: %s\n",
         (md_nid == NID_undef) ? "UNKNOWN" : OBJ_nid2sn(md_nid));
+
+    /* Unauthenticated attributes */
+    auth_attr = PKCS7_get_signed_attributes(si); /* cont[0] */
     printf("\nAuthenticated attributes:\n");
-    auth_attr = PKCS7_get_signed_attributes(si);  /* cont[0] */
     for (i=0; i<X509at_get_attr_count(auth_attr); i++) {
         attr = X509at_get_attr(auth_attr, i);
         object = X509_ATTRIBUTE_get0_object(attr);
@@ -2040,7 +2605,13 @@ static time_t time_t_timestamp_get_attributes(CMS_ContentInfo **timestamp, PKCS7
                 printf("\tLow level of permissions in Microsoft Internet Explorer 4.x for CAB files\n");
             else
                 printf("\tUnrecognized level of permissions in Microsoft Internet Explorer 4.x for CAB files\n");
-            }
+        } else if (!strcmp(object_txt, PKCS9_SEQUENCE_NUMBER)) {
+            /* PKCS#9 sequence number - Policy OID: 1.2.840.113549.1.9.25.4 */
+            ASN1_INTEGER *number = X509_ATTRIBUTE_get0_data(attr, 0, V_ASN1_INTEGER, NULL);
+            if (number == NULL)
+                continue;
+            printf("\tSequence number: %ld\n", ASN1_INTEGER_get(number));
+         }
     }
 
     /* Unauthenticated attributes */
@@ -2143,47 +2714,70 @@ static time_t time_t_get_asn1_time(const ASN1_TIME *s)
     if (ASN1_TIME_to_tm(s, &tm)) {
 #ifdef _WIN32
         return _mkgmtime(&tm);
-#else
+#else /* _WIN32 */
         return timegm(&tm);
-#endif
+#endif /* _WIN32 */
     } else {
         return INVALID_TIME;
     }
 }
 
 /*
- * Get signing time from authorized attributes
+ * Get signing time from authenticated attributes
  * [in] si: PKCS7_SIGNER_INFO structure
  * [returns] INVALID_TIME on error or time_t on success
  */
 static time_t time_t_get_si_time(PKCS7_SIGNER_INFO *si)
 {
-    STACK_OF(X509_ATTRIBUTE) *auth_attr;
-    X509_ATTRIBUTE *attr;
-    ASN1_OBJECT *object;
-    ASN1_UTCTIME *time = NULL;
-    time_t posix_time;
-    char object_txt[128];
-    int i;
+    ASN1_UTCTIME *time = asn1_time_get_si_time(si);
 
-    auth_attr = PKCS7_get_signed_attributes(si);  /* cont[0] */
-    if (auth_attr)
+    if (time == NULL)
+        return INVALID_TIME; /* FAILED */
+    return time_t_get_asn1_time(time);
+}
+
+/*
+ * Get signing time from authenticated attributes cont[0]
+ * [in] si: PKCS7_SIGNER_INFO structure
+ * [returns] NULL on error or ASN1_UTCTIME on success
+ */
+static ASN1_UTCTIME *asn1_time_get_si_time(PKCS7_SIGNER_INFO *si)
+{
+    STACK_OF(X509_ATTRIBUTE) *auth_attr = PKCS7_get_signed_attributes(si);
+    if (auth_attr) {
+        int i;
         for (i=0; i<X509at_get_attr_count(auth_attr); i++) {
-            attr = X509at_get_attr(auth_attr, i);
-            object = X509_ATTRIBUTE_get0_object(attr);
-            if (object == NULL)
-                return INVALID_TIME; /* FAILED */
-            object_txt[0] = 0x00;
-            OBJ_obj2txt(object_txt, sizeof object_txt, object, 1);
-            if (!strcmp(object_txt, PKCS9_SIGNING_TIME)) {
+            int nid = OBJ_txt2nid(PKCS9_SIGNING_TIME);
+            X509_ATTRIBUTE *attr = X509at_get_attr(auth_attr, i);
+            if (OBJ_obj2nid(X509_ATTRIBUTE_get0_object(attr)) == nid) {
                 /* PKCS#9 signing time - Policy OID: 1.2.840.113549.1.9.5 */
-                time = X509_ATTRIBUTE_get0_data(attr, 0, V_ASN1_UTCTIME, NULL);
-                if (time == NULL)
-                    return INVALID_TIME; /* FAILED */
+                return X509_ATTRIBUTE_get0_data(attr, 0, V_ASN1_UTCTIME, NULL);
             }
         }
-    posix_time = time_t_get_asn1_time(time);
-    return posix_time;
+    }
+    return NULL;
+}
+
+/*
+ * Get sequence number from authenticated attributes cont[0]
+ * [in] si: PKCS7_SIGNER_INFO structure
+ * [returns] NULL on error or ASN1_UTCTIME on success
+ */
+static long get_sequence_number(PKCS7_SIGNER_INFO *si)
+{
+    STACK_OF(X509_ATTRIBUTE) *auth_attr = PKCS7_get_signed_attributes(si);
+    if (auth_attr) {
+        int i;
+        for (i=0; i<X509at_get_attr_count(auth_attr); i++) {
+            int nid = OBJ_txt2nid(PKCS9_SEQUENCE_NUMBER);
+            X509_ATTRIBUTE *attr = X509at_get_attr(auth_attr, i);
+            if (OBJ_obj2nid(X509_ATTRIBUTE_get0_object(attr)) == nid) {
+                /* PKCS#9 sequence number - Policy OID:1.2.840.113549.1.9.25.4 */
+                return ASN1_INTEGER_get(X509_ATTRIBUTE_get0_data(attr, 0, V_ASN1_INTEGER, NULL));
+            }
+        }
+    }
+    return 0;
 }
 
 /*
@@ -2272,35 +2866,24 @@ out:
  * The attribute type is SPC_INDIRECT_DATA_OBJID, so get a digest algorithm and a message digest
  * from the content and compare the message digest against the computed message digest of the file
  * [in] ctx: structure holds input and output data
- * [in] attribute: structure holds input and output data
+ * [in] content: catalog file content
  * [returns] 1 on error or 0 on success
  */
-static int verify_member(FILE_FORMAT_CTX *ctx, CatalogAuthAttr *attribute)
+static int verify_content_member_digest(FILE_FORMAT_CTX *ctx, ASN1_TYPE *content)
 {
     int mdlen, mdtype = -1;
     u_char mdbuf[EVP_MAX_MD_SIZE];
     SpcIndirectDataContent *idc;
     const u_char *data;
     ASN1_STRING *value;
-    STACK_OF(ASN1_TYPE) *contents;
-    ASN1_TYPE *content;
     const EVP_MD *md;
     u_char *cmdbuf = NULL;
 
-    value = attribute->contents->value.sequence;
-    data = value->data;
-    contents = d2i_ASN1_SET_ANY(NULL, &data, value->length);
-    if (contents == NULL) {
-        return 1; /* FAILED */
-    }
-    content = sk_ASN1_TYPE_value(contents, 0);
-    sk_ASN1_TYPE_free(contents);
     value = content->value.sequence;
-    data = value->data;
-    idc = d2i_SpcIndirectDataContent(NULL, &data, value->length);
+    data = ASN1_STRING_get0_data(value);
+    idc = d2i_SpcIndirectDataContent(NULL, &data, ASN1_STRING_length(value));
     if (!idc) {
         printf("Failed to extract SpcIndirectDataContent data\n");
-        ASN1_TYPE_free(content);
         return 1; /* FAILED */
     }
     if (idc->messageDigest && idc->messageDigest->digest && idc->messageDigest->digestAlgorithm) {
@@ -2308,7 +2891,6 @@ static int verify_member(FILE_FORMAT_CTX *ctx, CatalogAuthAttr *attribute)
         mdtype = OBJ_obj2nid(idc->messageDigest->digestAlgorithm->algorithm);
         memcpy(mdbuf, idc->messageDigest->digest->data, (size_t)idc->messageDigest->digest->length);
     }
-    ASN1_TYPE_free(content);
     if (mdtype == -1) {
         printf("Failed to extract current message digest\n\n");
         SpcIndirectDataContent_free(idc);
@@ -2356,46 +2938,45 @@ static int verify_member(FILE_FORMAT_CTX *ctx, CatalogAuthAttr *attribute)
  */
 static int verify_content(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
 {
-    ASN1_STRING *value;
-    ASN1_OBJECT *indir_objid;
-    const u_char *data;
     MsCtlContent *ctlc;
-    int i, j;
+    int i;
 
-    if (!is_content_type(p7, MS_CTL_OBJID)) {
-        printf("Failed to find MS_CTL_OBJID\n");
-        return 1; /* FAILED */
-    }
-    value = p7->d.sign->contents->d.other->value.sequence;
-    data = value->data;
-    ctlc = d2i_MsCtlContent(NULL, &data, value->length);
+    ctlc = ms_ctl_content_get(p7);
     if (!ctlc) {
         printf("Failed to extract MS_CTL_OBJID data\n");
         return 1; /* FAILED */
     }
-    indir_objid = OBJ_txt2obj(SPC_INDIRECT_DATA_OBJID, 1);
     for (i = 0; i < sk_CatalogInfo_num(ctlc->header_attributes); i++) {
-        STACK_OF(CatalogAuthAttr) *attributes;
+        int j;
         CatalogInfo *header_attr = sk_CatalogInfo_value(ctlc->header_attributes, i);
         if (header_attr == NULL)
             continue;
-        attributes = header_attr->attributes;
-        for (j = 0; j < sk_CatalogAuthAttr_num(attributes); j++) {
-            CatalogAuthAttr *attribute = sk_CatalogAuthAttr_value(attributes, j);
+        for (j = 0; j < sk_CatalogAuthAttr_num(header_attr->attributes); j++) {
+            char object_txt[128];
+            CatalogAuthAttr *attribute;
+            ASN1_TYPE *content;
+
+            attribute = sk_CatalogAuthAttr_value(header_attr->attributes, j);
             if (!attribute)
                 continue;
-            if (OBJ_cmp(attribute->type, indir_objid))
+            content = catalog_content_get(attribute);
+            if (!content)
                 continue;
-            if (!verify_member(ctx, attribute)) {
-                /* computed message digest of the file is found in the catalog file */
-                MsCtlContent_free(ctlc);
-                ASN1_OBJECT_free(indir_objid);
-                return 0; /* OK */
+            object_txt[0] = 0x00;
+            OBJ_obj2txt(object_txt, sizeof object_txt, attribute->type, 1);
+            if (!strcmp(object_txt, SPC_INDIRECT_DATA_OBJID)) {
+                /* SPC_INDIRECT_DATA_OBJID OID: 1.3.6.1.4.1.311.2.1.4 */
+                if (!verify_content_member_digest(ctx, content)) {
+                    /* computed message digest of the file is found in the catalog file */
+                    ASN1_TYPE_free(content);
+                    MsCtlContent_free(ctlc);
+                    return 0; /* OK */
+                }
             }
+            ASN1_TYPE_free(content);
         }
     }
     MsCtlContent_free(ctlc);
-    ASN1_OBJECT_free(indir_objid);
     ERR_print_errors_fp(stdout);
     return 1; /* FAILED */
 }
@@ -2447,7 +3028,7 @@ static int verify_signature(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
             time = INVALID_TIME;
         } else {
             int timeok = verify_timestamp(ctx, p7, timestamp, time);
-            printf("Timestamp Server Signature verification: %s\n", timeok ? "ok" : "failed");
+            printf("\nTimestamp Server Signature verification: %s\n", timeok ? "ok" : "failed");
             if (!timeok) {
                 time = INVALID_TIME;
             }
@@ -2465,90 +3046,25 @@ static int verify_signature(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
 }
 
 /*
- * Create new SIGNATURE structure, get signed and unsigned attributes,
- * insert this signature to signature list
- * [in, out] signatures: signature list
- * [in] p7: PKCS#7 signature
- * [in] allownest: allow nested signature switch
- * [returns] 0 on error or 1 on success
- */
-static int signature_list_append_pkcs7(STACK_OF(PKCS7) **signatures, PKCS7 *p7, int allownest)
-{
-    PKCS7_SIGNER_INFO *si;
-    STACK_OF(X509_ATTRIBUTE) *unauth_attr;
-    STACK_OF(PKCS7_SIGNER_INFO) *signer_info = PKCS7_get_signer_info(p7);
-
-    if (!signer_info) {
-        printf("Failed to obtain PKCS#7 signer info list\n");
-        return 0; /* FAILED */
-    }
-    si = sk_PKCS7_SIGNER_INFO_value(signer_info, 0);
-    if (!si) {
-        printf("Failed to obtain PKCS#7 signer info value\n");
-        return 0; /* FAILED */
-    }
-    unauth_attr = PKCS7_get_attributes(si); /* cont[1] */
-    if (unauth_attr) {
-        /* find Nested Signature - Policy OID: 1.3.6.1.4.1.311.2.4.1 */
-        int i;
-        for (i=0; i<X509at_get_attr_count(unauth_attr); i++) {
-            ASN1_STRING *value;
-            char object_txt[128];
-            const u_char *data;
-            int j;
-            X509_ATTRIBUTE *attr = X509at_get_attr(unauth_attr, i);
-            ASN1_OBJECT *object = X509_ATTRIBUTE_get0_object(attr);
-            if (object == NULL)
-                continue;
-            object_txt[0] = 0x00;
-            OBJ_obj2txt(object_txt, sizeof object_txt, object, 1);
-            if (allownest && !strcmp(object_txt, SPC_NESTED_SIGNATURE_OBJID)) {
-                PKCS7 *nested;
-                for (j=0; j<X509_ATTRIBUTE_count(attr); j++) {
-                    value = X509_ATTRIBUTE_get0_data(attr, j, V_ASN1_SEQUENCE, NULL);
-                    if (value == NULL)
-                        continue;
-                    data = ASN1_STRING_get0_data(value);
-                    nested = d2i_PKCS7(NULL, &data, ASN1_STRING_length(value));
-                    if (nested) {
-                        if (!signature_list_append_pkcs7(signatures, nested, 0)) {
-                            printf("Failed to append signature list\n\n");
-                            PKCS7_free(nested);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if (!sk_PKCS7_unshift(*signatures, p7)) {
-        printf("Failed to insert signature\n");
-        return 0; /* FAILED */
-    }
-    return 1; /* OK */
-}
-
-/*
  * [in] ctx: structure holds input and output data
  * [returns] 1 on error or 0 on success
  */
 static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
 {
-    int i, ret = 1;
+    int i, ret = 1, verified = 0;
     PKCS7 *p7;
-    STACK_OF(PKCS7) *signatures;
+    STACK_OF(PKCS7) *signatures = NULL;
     int detached = options->catalog ? 1 : 0;
-
-    if (!ctx->format->check_file) {
-        printf("Unsupported method: check_file\n");
-        return 1; /* FAILED */
-    }
-
-    if (!ctx->format->check_file(ctx, detached))
-        return 1; /* FAILED */
 
     if (detached) {
         GLOBAL_OPTIONS *cat_options;
         FILE_FORMAT_CTX *cat_ctx;
+
+        if (!ctx->format->is_detaching_supported || !ctx->format->is_detaching_supported()) {
+            printf("This format does not support detached PKCS#7 signature\n");
+            return 1; /* FAILED */
+        }
+        printf("Checking the specified catalog file\n\n");
         cat_options = OPENSSL_memdup(options, sizeof(GLOBAL_OPTIONS));
         if (!cat_options) {
             printf("OPENSSL_memdup error.\n");
@@ -2566,7 +3082,7 @@ static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
             return 1; /* FAILED */
         }
         p7 = cat_ctx->format->pkcs7_extract(cat_ctx);
-        cat_ctx->format->ctx_cleanup(cat_ctx, NULL, NULL);
+        cat_ctx->format->ctx_cleanup(cat_ctx);
         OPENSSL_free(cat_options);
     } else {
         if (!ctx->format->pkcs7_extract) {
@@ -2579,31 +3095,39 @@ static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
         printf("Unable to extract existing signature\n");
         return 1; /* FAILED */
     }
-    signatures = sk_PKCS7_new_null();
-    if (!signature_list_append_pkcs7(&signatures, p7, 1)) {
+    signatures = signature_list_create(p7);
+    if (!signatures) {
         printf("Failed to create signature list\n\n");
         sk_PKCS7_pop_free(signatures, PKCS7_free);
         return 1; /* FAILED */
     }
     for (i = 0; i < sk_PKCS7_num(signatures); i++) {
-        PKCS7 *sig = sk_PKCS7_value(signatures, i);
+        PKCS7 *sig;
+
+        if (options->index >= 0 && options->index != i) {
+            printf("Warning: signature verification at index %d was skipped\n", i);
+            continue;
+        }
+        sig = sk_PKCS7_value(signatures, i);
         if (detached) {
             if (!verify_content(ctx, sig)) {
                 ret &= verify_signature(ctx, sig);
             } else {
                 printf("Catalog verification: failed\n\n");
             }
+            verified++;
         } else if (ctx->format->verify_digests) {
             printf("\nSignature Index: %d %s\n\n", i, i==0 ? " (Primary Signature)" : "");
             if (ctx->format->verify_digests(ctx, sig)) {
                 ret &= verify_signature(ctx, sig);
             }
+            verified++;
         } else {
             printf("Unsupported method: verify_digests\n");
             return 1; /* FAILED */
         }
     }
-    printf("Number of verified signatures: %d\n", i);
+    printf("Number of verified signatures: %d\n", verified);
     sk_PKCS7_pop_free(signatures, PKCS7_free);
     if (ret)
         ERR_print_errors_fp(stdout);
@@ -2611,27 +3135,143 @@ static int verify_signed_file(FILE_FORMAT_CTX *ctx, GLOBAL_OPTIONS *options)
 }
 
 /*
- * [in, out] ctx: structure holds input and output data
- * [out] outdata: BIO outdata file
+ * Insert PKCS#7 signature and its nested signatures to the sorted signature list
  * [in] p7: PKCS#7 signature
- * [returns] 1 on error or 0 on success
+ * [returns] sorted signature list
  */
-static int save_extracted_pkcs7(FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7)
+static STACK_OF(PKCS7) *signature_list_create(PKCS7 *p7)
 {
-    int ret;
+    STACK_OF(PKCS7) *signatures = NULL;
+    PKCS7_SIGNER_INFO *si;
+    STACK_OF(X509_ATTRIBUTE) *unauth_attr;
+    STACK_OF(PKCS7_SIGNER_INFO) *signer_info = PKCS7_get_signer_info(p7);
 
-    (void)BIO_reset(outdata);
-    if (ctx->options->output_pkcs7) {
-        /* PEM format */
-        ret = !PEM_write_bio_PKCS7(outdata, p7);
-    } else {
-        /* default DER format */
-        ret = !i2d_PKCS7_bio(outdata, p7);
+    if (!signer_info) {
+        printf("Failed to obtain PKCS#7 signer info list\n");
+        return 0; /* FAILED */
     }
-    if (ret) {
-        printf("Unable to write pkcs7 object\n");
+    si = sk_PKCS7_SIGNER_INFO_value(signer_info, 0);
+    if (!si) {
+        printf("Failed to obtain PKCS#7 signer info value\n");
+        return 0; /* FAILED */
     }
+    signatures = sk_PKCS7_new(PKCS7_compare);
+    if (!signatures) {
+        printf("Failed to create new signature list\n");
+        return 0; /* FAILED */
+    }
+    /* Unauthenticated attributes */
+    unauth_attr = PKCS7_get_attributes(si); /* cont[1] */
+    if (unauth_attr) {
+        /* find Nested Signature - Policy OID: 1.3.6.1.4.1.311.2.4.1 */
+        int i;
+        for (i=0; i<X509at_get_attr_count(unauth_attr); i++) {
+            int nid = OBJ_txt2nid(SPC_NESTED_SIGNATURE_OBJID);
+            X509_ATTRIBUTE *attr = X509at_get_attr(unauth_attr, i);
+            if (OBJ_obj2nid(X509_ATTRIBUTE_get0_object(attr)) == nid) {
+                int j;
+
+                for (j=0; j<X509_ATTRIBUTE_count(attr); j++) {
+                    ASN1_STRING *value;
+                    const u_char *data;
+                    PKCS7 *nested;
+
+                    value = X509_ATTRIBUTE_get0_data(attr, j, V_ASN1_SEQUENCE, NULL);
+                    if (value == NULL)
+                        continue;
+                    data = ASN1_STRING_get0_data(value);
+                    nested = d2i_PKCS7(NULL, &data, ASN1_STRING_length(value));
+                    if (nested && !sk_PKCS7_push(signatures, nested)) {
+                        printf("Failed to add nested signature\n");
+                        PKCS7_free(nested);
+                        sk_PKCS7_pop_free(signatures, PKCS7_free);
+                        return NULL; /* FAILED */
+                    }
+                }
+            }
+        }
+    }
+    /* sort signatures in ascending order by signing time */
+    sk_PKCS7_sort(signatures);
+    /* insert the prime signature at index 0 */
+    sk_PKCS7_unshift(signatures, p7);
+    return signatures; /* OK */
+}
+
+/*
+ * PKCS#7 signature comparison function
+ * [in] a_ptr, b_ptr: pointers to PKCS#7 signatures
+ * [returns] signatures order
+ */
+static int PKCS7_compare(const PKCS7 *const *a, const PKCS7 *const *b)
+{
+    PKCS7 *p7_a = NULL, *p7_b = NULL;
+    STACK_OF(PKCS7_SIGNER_INFO) *signer_info;
+    PKCS7_SIGNER_INFO *si;
+    const ASN1_TIME *time_a, *time_b;
+    long index_a, index_b;
+    int ret = 0;
+
+    p7_a = PKCS7_dup(*a);
+    if (!p7_a)
+        goto out;
+    signer_info = PKCS7_get_signer_info(p7_a);
+    if (!signer_info)
+        goto out;
+    si = sk_PKCS7_SIGNER_INFO_value(signer_info, 0);
+    if (!si)
+        goto out;
+    time_a = asn1_time_get_si_time(si);
+    index_a = get_sequence_number(si);
+
+    p7_b = PKCS7_dup(*b);
+    if (!p7_b)
+        goto out;
+    signer_info = PKCS7_get_signer_info(p7_b);
+    if (!signer_info)
+        goto out;
+    si = sk_PKCS7_SIGNER_INFO_value(signer_info, 0);
+    if (!si)
+        goto out;
+    time_b = asn1_time_get_si_time(si);
+    index_b = get_sequence_number(si);
+
+    if (index_a == index_b)
+        ret = ASN1_TIME_compare(time_a, time_b);
+    else
+        ret = (index_a == 0 || index_a < index_b) ? 1 : -1;
+
+out:
+    PKCS7_free(p7_a);
+    PKCS7_free(p7_b);
     return ret;
+}
+
+/*
+ * Retrieve a decoded PKCS#7 structure corresponding to the signature
+ * stored in the "sigin" file
+ * CMD_ATTACH command specific
+ * [in] ctx: structure holds input and output data
+ * [returns] pointer to PKCS#7 structure
+ */
+static PKCS7 *pkcs7_get_sigfile(FILE_FORMAT_CTX *ctx)
+{
+    PKCS7 *p7 = NULL;
+    uint32_t filesize;
+    char *indata;
+
+    filesize = get_file_size(ctx->options->sigfile);
+    if (!filesize) {
+        return NULL; /* FAILED */
+    }
+    indata = map_file(ctx->options->sigfile, filesize);
+    if (!indata) {
+        printf("Failed to open file: %s\n", ctx->options->sigfile);
+        return NULL; /* FAILED */
+    }
+    p7 = pkcs7_read_data(indata, filesize);
+    unmap_file(indata, filesize);
+    return p7;
 }
 
 /*
@@ -2651,7 +3291,9 @@ static int check_attached_data(GLOBAL_OPTIONS *options)
     tmp_options->infile = options->outfile;
     tmp_options->cmd = CMD_VERIFY;
 
-    ctx = file_format_msi.ctx_new(tmp_options, NULL, NULL);
+    ctx = file_format_script.ctx_new(tmp_options, NULL, NULL);
+    if (!ctx)
+        ctx = file_format_msi.ctx_new(tmp_options, NULL, NULL);
     if (!ctx)
         ctx = file_format_pe.ctx_new(tmp_options, NULL, NULL);
     if (!ctx)
@@ -2667,11 +3309,11 @@ static int check_attached_data(GLOBAL_OPTIONS *options)
     }
     if (verify_signed_file(ctx, tmp_options)) {
         printf("Signature mismatch\n");
-        ctx->format->ctx_cleanup(ctx, NULL, NULL);
+        ctx->format->ctx_cleanup(ctx);
         OPENSSL_free(tmp_options);
         return 1; /* Failed */
     }
-    ctx->format->ctx_cleanup(ctx, NULL, NULL);
+    ctx->format->ctx_cleanup(ctx);
     OPENSSL_free(tmp_options);
     return 0; /* OK */
 }
@@ -2684,8 +3326,10 @@ static void free_options(GLOBAL_OPTIONS *options)
 {
     /* If memory has not been allocated nothing is done */
     OPENSSL_free(options->cafile);
-    OPENSSL_free(options->tsa_cafile);
     OPENSSL_free(options->crlfile);
+    OPENSSL_free(options->https_cafile);
+    OPENSSL_free(options->https_crlfile);
+    OPENSSL_free(options->tsa_cafile);
     OPENSSL_free(options->tsa_crlfile);
     /* If key is NULL nothing is done */
     EVP_PKEY_free(options->pkey);
@@ -2693,9 +3337,6 @@ static void free_options(GLOBAL_OPTIONS *options)
     /* If X509 structure is NULL nothing is done */
     X509_free(options->cert);
     options->cert = NULL;
-    /* If PKCS7 structure is NULL nothing is done */
-    PKCS7_free(options->prevsig);
-    options->prevsig = NULL;
     /* Free up all elements of sk structure and sk itself */
     sk_X509_pop_free(options->certs, X509_free);
     options->certs = NULL;
@@ -2713,6 +3354,7 @@ static void usage(const char *argv0, const char *cmd)
 {
     const char *cmds_all[] = {"all", NULL};
     const char *cmds_sign[] = {"all", "sign", NULL};
+    const char *cmds_extract_data[] = {"all", "extract-data", NULL};
     const char *cmds_add[] = {"all", "add", NULL};
     const char *cmds_attach[] = {"all", "attach-signature", NULL};
     const char *cmds_extract[] = {"all", "extract-signature", NULL};
@@ -2725,9 +3367,10 @@ static void usage(const char *argv0, const char *cmd)
         printf("%1s[ --help ]\n\n", "");
     }
     if (on_list(cmd, cmds_sign)) {
-        printf("%1s[ sign ] ( -certs | -spc <certfile> -key <keyfile> | -pkcs12 <pkcs12file> |\n", "");
-        printf("%12s  [ -pkcs11engine <engine> ] -pkcs11module <module> -pkcs11cert <pkcs11 cert id> |\n", "");
-        printf("%12s  -certs <certfile> -key <pkcs11 key id>)\n", "");
+        printf("%1s[ sign ] ( -pkcs12 <pkcs12file>\n", "");
+        printf("%13s | ( -certs <certfile> | -spc <certfile> ) -key <keyfile>\n", "");
+        printf("%13s | [ -pkcs11engine <engine> ] -pkcs11module <module>\n", "");
+        printf("%15s ( -pkcs11cert <pkcs11 cert id> | -certs <certfile> ) -key <pkcs11 key id> )\n", "");
 #if OPENSSL_VERSION_NUMBER>=0x30000000L
         printf("%12s[ -nolegacy ]\n", "");
 #endif /* OPENSSL_VERSION_NUMBER>=0x30000000L */
@@ -2736,32 +3379,42 @@ static void usage(const char *argv0, const char *cmd)
         printf("%1s [ -askpass ]", "");
 #endif /* PROVIDE_ASKPASS */
         printf("%1s[ -readpass <file> ]\n", "");
+        printf("%12s(use \"-\" with readpass to read from stdin)\n", "");
         printf("%12s[ -ac <crosscertfile> ]\n", "");
         printf("%12s[ -h {md5,sha1,sha2(56),sha384,sha512} ]\n", "");
         printf("%12s[ -n <desc> ] [ -i <url> ] [ -jp <level> ] [ -comm ]\n", "");
         printf("%12s[ -ph ]\n", "");
-#ifdef ENABLE_CURL
         printf("%12s[ -t <timestampurl> [ -t ... ] [ -p <proxy> ] [ -noverifypeer  ]\n", "");
         printf("%12s[ -ts <timestampurl> [ -ts ... ] [ -p <proxy> ] [ -noverifypeer ] ]\n", "");
-#endif /* ENABLE_CURL */
         printf("%12s[ -TSA-certs <TSA-certfile> ] [ -TSA-key <TSA-keyfile> ]\n", "");
         printf("%12s[ -TSA-time <unix-time> ]\n", "");
+        printf("%12s[ -HTTPS-CAfile <infile> ]\n", "");
+        printf("%12s[ -HTTPS-CRLfile <infile> ]\n", "");
         printf("%12s[ -time <unix-time> ]\n", "");
         printf("%12s[ -addUnauthenticatedBlob ]\n", "");
         printf("%12s[ -nest ]\n", "");
         printf("%12s[ -verbose ]\n", "");
         printf("%12s[ -add-msi-dse ]\n", "");
+        printf("%12s[ -pem ]\n", "");
         printf("%12s[ -in ] <infile> [-out ] <outfile>\n\n", "");
+    }
+    if (on_list(cmd, cmds_extract_data)) {
+        printf("%1sextract-data [ -pem ]\n", "");
+        printf("%12s[ -h {md5,sha1,sha2(56),sha384,sha512} ]\n", "");
+        printf("%12s[ -ph ]\n", "");
+        printf("%12s[ -add-msi-dse ]\n", "");
+        printf("%12s[ -in ] <infile> [ -out ] <datafile>\n\n", "");
     }
     if (on_list(cmd, cmds_add)) {
         printf("%1sadd [-addUnauthenticatedBlob]\n", "");
-#ifdef ENABLE_CURL
         printf("%12s[ -t <timestampurl> [ -t ... ] [ -p <proxy> ] [ -noverifypeer  ]\n", "");
         printf("%12s[ -ts <timestampurl> [ -ts ... ] [ -p <proxy> ] [ -noverifypeer ] ]\n", "");
-#endif /* ENABLE_CURL */
         printf("%12s[ -TSA-certs <TSA-certfile> ] [ -TSA-key <TSA-keyfile> ]\n", "");
         printf("%12s[ -TSA-time <unix-time> ]\n", "");
+        printf("%12s[ -HTTPS-CAfile <infile> ]\n", "");
+        printf("%12s[ -HTTPS-CRLfile <infile> ]\n", "");
         printf("%12s[ -h {md5,sha1,sha2(56),sha384,sha512} ]\n", "");
+        printf("%12s[ -index <index> ]\n", "");
         printf("%12s[ -verbose ]\n", "");
         printf("%12s[ -add-msi-dse ]\n", "");
         printf("%12s[ -in ] <infile> [ -out ] <outfile>\n\n", "");
@@ -2790,9 +3443,14 @@ static void usage(const char *argv0, const char *cmd)
         printf("%12s[ -c | -catalog <infile> ]\n", "");
         printf("%12s[ -CAfile <infile> ]\n", "");
         printf("%12s[ -CRLfile <infile> ]\n", "");
+        printf("%12s[ -HTTPS-CAfile <infile> ]\n", "");
+        printf("%12s[ -HTTPS-CRLfile <infile> ]\n", "");
         printf("%12s[ -TSA-CAfile <infile> ]\n", "");
         printf("%12s[ -TSA-CRLfile <infile> ]\n", "");
+        printf("%12s[ -p <proxy> ]\n", "");
+        printf("%12s[ -index <index> ]\n", "");
         printf("%12s[ -ignore-timestamp ]\n", "");
+        printf("%12s[ -ignore-cdp ]\n", "");
         printf("%12s[ -time <unix-time> ]\n", "");
         printf("%12s[ -require-leaf-hash {md5,sha1,sha2(56),sha384,sha512}:XXXXXXXXXXXX... ]\n", "");
         printf("%12s[ -verbose ]\n\n", "");
@@ -2811,9 +3469,10 @@ static void help_for(const char *argv0, const char *cmd)
     const char *cmds_extract[] = {"extract-signature", NULL};
     const char *cmds_remove[] = {"remove-signature", NULL};
     const char *cmds_sign[] = {"sign", NULL};
+    const char *cmds_extract_data[] = {"extract-data", NULL};
     const char *cmds_verify[] = {"verify", NULL};
     const char *cmds_ac[] = {"sign", NULL};
-    const char *cmds_add_msi_dse[] = {"add", "attach-signature", "sign", NULL};
+    const char *cmds_add_msi_dse[] = {"add", "attach-signature", "sign", "extract-data", NULL};
     const char *cmds_addUnauthenticatedBlob[] = {"sign", "add", NULL};
 #ifdef PROVIDE_ASKPASS
     const char *cmds_askpass[] = {"sign", NULL};
@@ -2823,10 +3482,13 @@ static void help_for(const char *argv0, const char *cmd)
     const char *cmds_certs[] = {"sign", NULL};
     const char *cmds_comm[] = {"sign", NULL};
     const char *cmds_CRLfile[] = {"attach-signature", "verify", NULL};
+    const char *cmds_CRLfileHTTPS[] = {"add", "sign", "verify", NULL};
     const char *cmds_CRLfileTSA[] = {"attach-signature", "verify", NULL};
-    const char *cmds_h[] = {"add", "attach-signature", "sign", NULL};
+    const char *cmds_h[] = {"add", "attach-signature", "sign", "extract-data", NULL};
     const char *cmds_i[] = {"sign", NULL};
-    const char *cmds_in[] = {"add", "attach-signature", "extract-signature", "remove-signature", "sign", "verify", NULL};
+    const char *cmds_in[] = {"add", "attach-signature", "extract-signature",
+        "remove-signature", "sign", "extract-data", "verify", NULL};
+    const char *cmds_index[] = {"add", "verify", NULL};
     const char *cmds_jp[] = {"sign", NULL};
     const char *cmds_key[] = {"sign", NULL};
 #if OPENSSL_VERSION_NUMBER>=0x30000000L
@@ -2834,16 +3496,13 @@ static void help_for(const char *argv0, const char *cmd)
 #endif /* OPENSSL_VERSION_NUMBER>=0x30000000L */
     const char *cmds_n[] = {"sign", NULL};
     const char *cmds_nest[] = {"attach-signature", "sign", NULL};
-#ifdef ENABLE_CURL
     const char *cmds_noverifypeer[] = {"add", "sign", NULL};
-#endif /* ENABLE_CURL */
-    const char *cmds_out[] = {"add", "attach-signature", "extract-signature", "remove-signature", "sign", NULL};
-#ifdef ENABLE_CURL
-    const char *cmds_p[] = {"add", "sign", NULL};
-#endif /* ENABLE_CURL */
+    const char *cmds_out[] = {"add", "attach-signature", "extract-signature",
+        "remove-signature", "sign", "extract-data", NULL};
+    const char *cmds_p[] = {"add", "sign", "verify", NULL};
     const char *cmds_pass[] = {"sign", NULL};
-    const char *cmds_pem[] = {"extract-signature", NULL};
-    const char *cmds_ph[] = {"sign", NULL};
+    const char *cmds_pem[] = {"sign", "extract-data", "extract-signature", NULL};
+    const char *cmds_ph[] = {"sign", "extract-data", NULL};
     const char *cmds_pkcs11cert[] = {"sign", NULL};
     const char *cmds_pkcs11engine[] = {"sign", NULL};
     const char *cmds_pkcs11module[] = {"sign", NULL};
@@ -2853,10 +3512,10 @@ static void help_for(const char *argv0, const char *cmd)
     const char *cmds_sigin[] = {"attach-signature", NULL};
     const char *cmds_time[] = {"attach-signature", "sign", "verify", NULL};
     const char *cmds_ignore_timestamp[] = {"verify", NULL};
-#ifdef ENABLE_CURL
+    const char *cmds_ignore_cdp[] = {"verify", NULL};
     const char *cmds_t[] = {"add", "sign", NULL};
     const char *cmds_ts[] = {"add", "sign", NULL};
-#endif /* ENABLE_CURL */
+    const char *cmds_CAfileHTTPS[] = {"add", "sign", "verify", NULL};
     const char *cmds_CAfileTSA[] = {"attach-signature", "verify", NULL};
     const char *cmds_certsTSA[] = {"add", "sign", NULL};
     const char *cmds_keyTSA[] = {"add", "sign", NULL};
@@ -2906,6 +3565,10 @@ static void help_for(const char *argv0, const char *cmd)
         printf("parameters and to select the signing certificate you wish to use.\n\n");
         printf("Options:\n");
     }
+    if (on_list(cmd, cmds_extract_data)) {
+        printf("\nUse the \"extract-data\" command to extract a data content to be signed.\n\n");
+        printf("Options:\n");
+    }
     if (on_list(cmd, cmds_verify)) {
         printf("\nUse the \"verify\" command to verify embedded signatures.\n");
         printf("Verification determines if the signing certificate was issued by a trusted party,\n");
@@ -2942,6 +3605,8 @@ static void help_for(const char *argv0, const char *cmd)
         printf("%-24s= specifies a URL for expanded description of the signed content\n", "-i");
     if (on_list(cmd, cmds_in))
         printf("%-24s= input file\n", "-in");
+    if (on_list(cmd, cmds_index))
+        printf("%-24s= use the signature at a certain position\n", "-index");
     if (on_list(cmd, cmds_jp)) {
         printf("%-24s= low | medium | high\n", "-jp");
         printf("%26slevels of permissions in Microsoft Internet Explorer 4.x for CAB files\n", "");
@@ -2957,20 +3622,16 @@ static void help_for(const char *argv0, const char *cmd)
         printf("%-24s= specifies a description of the signed content\n", "-n");
     if (on_list(cmd, cmds_nest))
         printf("%-24s= add the new nested signature instead of replacing the first one\n", "-nest");
-#ifdef ENABLE_CURL
     if (on_list(cmd, cmds_noverifypeer))
         printf("%-24s= do not verify the Time-Stamp Authority's SSL certificate\n", "-noverifypeer");
-#endif /* ENABLE_CURL */
     if (on_list(cmd, cmds_out))
         printf("%-24s= output file\n", "-out");
-#ifdef ENABLE_CURL
     if (on_list(cmd, cmds_p))
-        printf("%-24s= proxy to connect to the desired Time-Stamp Authority server\n", "-p");
-#endif /* ENABLE_CURL */
+        printf("%-24s= proxy to connect to the desired Time-Stamp Authority server or CRL distribution point\n", "-p");
     if (on_list(cmd, cmds_pass))
         printf("%-24s= the private key password\n", "-pass");
     if (on_list(cmd, cmds_pem))
-        printf("%-24s= output data format PEM to use (default: DER)\n", "-pem");
+        printf("%-24s= PKCS#7 output data format PEM to use (default: DER)\n", "-pem");
     if (on_list(cmd, cmds_ph))
         printf("%-24s= generate page hashes for executable files\n", "-ph");
     if (on_list(cmd, cmds_pkcs11cert))
@@ -2993,7 +3654,8 @@ static void help_for(const char *argv0, const char *cmd)
         printf("%-24s= a file containing the signature to be attached\n", "-sigin");
     if (on_list(cmd, cmds_ignore_timestamp))
         printf("%-24s= disable verification of the Timestamp Server signature\n", "-ignore-timestamp");
-#ifdef ENABLE_CURL
+    if (on_list(cmd, cmds_ignore_cdp))
+        printf("%-24s= disable CRL Distribution Points online verification\n", "-ignore-cdp");
     if (on_list(cmd, cmds_t)) {
         printf("%-24s= specifies that the digital signature will be timestamped\n", "-t");
         printf("%26sby the Time-Stamp Authority (TSA) indicated by the URL\n", "");
@@ -3003,9 +3665,12 @@ static void help_for(const char *argv0, const char *cmd)
         printf("%-24s= specifies the URL of the RFC 3161 Time-Stamp Authority server\n", "-ts");
         printf("%26sthis option cannot be used with the -t option\n", "");
     }
-#endif /* ENABLE_CURL */
     if (on_list(cmd, cmds_time))
         printf("%-24s= the unix-time to set the signing and/or verifying time\n", "-time");
+    if (on_list(cmd, cmds_CAfileHTTPS))
+        printf("%-24s= the file containing one or more HTTPS certificates in PEM format\n", "-HTTPS-CAfile");
+    if (on_list(cmd, cmds_CRLfileHTTPS))
+        printf("%-24s= the file containing one or more HTTPS CRLs in PEM format\n", "-HTTPS-CRLfile");
     if (on_list(cmd, cmds_CAfileTSA))
         printf("%-24s= the file containing one or more Time-Stamp Authority certificates in PEM format\n", "-TSA-CAfile");
     if (on_list(cmd, cmds_CRLfileTSA))
@@ -3054,11 +3719,11 @@ static char *getpassword(const char *prompt)
     pass = OPENSSL_strdup(passbuf);
     memset(passbuf, 0, sizeof passbuf);
     return pass;
-#else
+#else /* HAVE_TERMIOS_H */
     return getpass(prompt);
-#endif
+#endif /* HAVE_TERMIOS_H */
 }
-#endif
+#endif /* PROVIDE_ASKPASS */
 
 /*
  * [in, out] options: structure holds the input data
@@ -3066,39 +3731,43 @@ static char *getpassword(const char *prompt)
  */
 static int read_password(GLOBAL_OPTIONS *options)
 {
-    char passbuf[4096];
+    char passbuf[4096] = {0};
     int passlen;
     const u_char utf8_bom[] = {0xef, 0xbb, 0xbf};
 
     if (options->readpass) {
+        if (!strcmp(options->readpass, "-")) {
+            passlen = (int)read(fileno(stdin), passbuf, sizeof(passbuf)-1);
+        } else {
 #ifdef WIN32
-        HANDLE fhandle, fmap;
-        LPVOID faddress;
-        fhandle = CreateFile(options->readpass, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        if (fhandle == INVALID_HANDLE_VALUE) {
-            return 0; /* FAILED */
-        }
-        fmap = CreateFileMapping(fhandle, NULL, PAGE_READONLY, 0, 0, NULL);
-        if (fmap == NULL) {
-            return 0; /* FAILED */
-        }
-        faddress = MapViewOfFile(fmap, FILE_MAP_READ, 0, 0, 0);
-        CloseHandle(fmap);
-        if (faddress == NULL) {
-            return 0; /* FAILED */
-        }
-        passlen = (int)GetFileSize(fhandle, NULL);
-        memcpy(passbuf, faddress, passlen);
-        UnmapViewOfFile(faddress);
-        CloseHandle(fhandle);
-#else
-        int passfd = open(options->readpass, O_RDONLY);
-        if (passfd < 0) {
-            return 0; /* FAILED */
-        }
-        passlen = (int)read(passfd, passbuf, sizeof passbuf - 1);
-        close(passfd);
+            HANDLE fhandle, fmap;
+            LPVOID faddress;
+            fhandle = CreateFile(options->readpass, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            if (fhandle == INVALID_HANDLE_VALUE) {
+                return 0; /* FAILED */
+            }
+            fmap = CreateFileMapping(fhandle, NULL, PAGE_READONLY, 0, 0, NULL);
+            if (fmap == NULL) {
+                return 0; /* FAILED */
+            }
+            faddress = MapViewOfFile(fmap, FILE_MAP_READ, 0, 0, 0);
+            CloseHandle(fmap);
+            if (faddress == NULL) {
+                return 0; /* FAILED */
+            }
+            passlen = (int)GetFileSize(fhandle, NULL);
+            memcpy(passbuf, faddress, passlen);
+            UnmapViewOfFile(faddress);
+            CloseHandle(fhandle);
+#else /* WIN32 */
+            int passfd = open(options->readpass, O_RDONLY);
+            if (passfd < 0) {
+                return 0; /* FAILED */
+            }
+            passlen = (int)read(passfd, passbuf, sizeof passbuf - 1);
+            close(passfd);
 #endif /* WIN32 */
+        }
         if (passlen <= 0) {
             return 0; /* FAILED */
         }
@@ -3554,23 +4223,33 @@ static char *get_cafile(void)
             return OPENSSL_strdup(files[i]);
         }
     }
-#endif
+#endif /* WIN32 */
     return NULL;
 }
 
 static void print_version(void)
 {
+    char *cafile = get_cafile();
+
 #ifdef PACKAGE_STRING
     printf("%s, using:\n", PACKAGE_STRING);
 #else /* PACKAGE_STRING */
     printf("%s, using:\n", "osslsigncode custom build");
 #endif /* PACKAGE_STRING */
     printf("\t%s (Library: %s)\n", OPENSSL_VERSION_TEXT, OpenSSL_version(OPENSSL_VERSION));
+#if OPENSSL_VERSION_NUMBER<0x30000000L
 #ifdef ENABLE_CURL
     printf("\t%s\n", curl_version());
 #else /* ENABLE_CURL */
     printf("\t%s\n", "no libcurl available");
 #endif /* ENABLE_CURL */
+#endif /* OPENSSL_VERSION_NUMBER<0x30000000L */
+    if (cafile) {
+        printf("Default -CAfile location: %s\n", cafile);
+        OPENSSL_free(cafile);
+    } else {
+        printf("No default -CAfile location detected\n");
+    }
 #ifdef PACKAGE_BUGREPORT
     printf("\nPlease send bug-reports to " PACKAGE_BUGREPORT "\n");
 #endif /* PACKAGE_BUGREPORT */
@@ -3592,6 +4271,8 @@ static cmd_type_t get_command(char **argv)
         return CMD_HELP;
     } else if (!strcmp(argv[1], "sign"))
         return CMD_SIGN;
+    else if (!strcmp(argv[1], "extract-data"))
+        return CMD_EXTRACT_DATA;
     else if (!strcmp(argv[1], "extract-signature"))
         return CMD_EXTRACT;
     else if (!strcmp(argv[1], "attach-signature"))
@@ -3689,6 +4370,8 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
     options->md = EVP_sha256();
     options->time = INVALID_TIME;
     options->jp = -1;
+    options->index = -1;
+    options->nested_number = -1;
 #if OPENSSL_VERSION_NUMBER>=0x30000000L
 /* Use legacy PKCS#12 container with RC2-40-CBC private key and certificate encryption algorithm */
     options->legacy = 1;
@@ -3697,8 +4380,9 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
     if (cmd == CMD_HELP) {
         return 0; /* FAILED */
     }
-    if (cmd == CMD_VERIFY || cmd == CMD_ATTACH) {
+    if (cmd == CMD_SIGN || cmd == CMD_VERIFY || cmd == CMD_ATTACH) {
         options->cafile = get_cafile();
+        options->https_cafile = get_cafile();
         options->tsa_cafile = get_cafile();
     }
     for (argc--,argv++; argc >= 1; argc--,argv++) {
@@ -3744,7 +4428,8 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
                 return 0; /* FAILED */
             }
             options->pkcs12file = *(++argv);
-        } else if ((cmd == CMD_EXTRACT) && !strcmp(*argv, "-pem")) {
+        } else if ((cmd == CMD_SIGN || cmd == CMD_EXTRACT || cmd == CMD_EXTRACT_DATA)
+                && !strcmp(*argv, "-pem")) {
             options->output_pkcs7 = 1;
 #ifndef OPENSSL_NO_ENGINE
         } else if ((cmd == CMD_SIGN) && !strcmp(*argv, "-pkcs11cert")) {
@@ -3788,7 +4473,7 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
                 return 0; /* FAILED */
             }
             options->askpass = 1;
-#endif
+#endif /* PROVIDE_ASKPASS */
         } else if ((cmd == CMD_SIGN) && !strcmp(*argv, "-readpass")) {
             if (options->askpass || options->pass) {
                 usage(argv0, "all");
@@ -3801,7 +4486,7 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
             options->readpass = *(++argv);
         } else if ((cmd == CMD_SIGN) && !strcmp(*argv, "-comm")) {
             options->comm = 1;
-        } else if ((cmd == CMD_SIGN) && !strcmp(*argv, "-ph")) {
+        } else if ((cmd == CMD_SIGN || cmd == CMD_EXTRACT_DATA) && !strcmp(*argv, "-ph")) {
             options->pagehash = 1;
         } else if ((cmd == CMD_SIGN) && !strcmp(*argv, "-n")) {
             if (--argc < 1) {
@@ -3809,8 +4494,8 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
                 return 0; /* FAILED */
             }
             options->desc = *(++argv);
-        } else if ((cmd == CMD_SIGN|| cmd == CMD_ADD || cmd == CMD_ATTACH)
-                && !strcmp(*argv, "-h")) {
+        } else if ((cmd == CMD_SIGN || cmd == CMD_ADD || cmd == CMD_ATTACH
+                || cmd == CMD_EXTRACT_DATA) && !strcmp(*argv, "-h")) {
             if (--argc < 1) {
                 usage(argv0, "all");
                 return 0; /* FAILED */
@@ -3843,7 +4528,6 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
                 return 0; /* FAILED */
             }
             options->time = (time_t)strtoull(*(++argv), NULL, 10);
-#ifdef ENABLE_CURL
         } else if ((cmd == CMD_SIGN || cmd == CMD_ADD) && !strcmp(*argv, "-t")) {
             if (--argc < 1) {
                 usage(argv0, "all");
@@ -3856,7 +4540,7 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
                 return 0; /* FAILED */
             }
             options->tsurl[options->ntsurl++] = *(++argv);
-        } else if ((cmd == CMD_SIGN || cmd == CMD_ADD) && !strcmp(*argv, "-p")) {
+        } else if ((cmd == CMD_SIGN || cmd == CMD_ADD || cmd == CMD_VERIFY) && !strcmp(*argv, "-p")) {
             if (--argc < 1) {
                 usage(argv0, "all");
                 return 0; /* FAILED */
@@ -3864,16 +4548,29 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
             options->proxy = *(++argv);
         } else if ((cmd == CMD_SIGN || cmd == CMD_ADD) && !strcmp(*argv, "-noverifypeer")) {
             options->noverifypeer = 1;
-#endif
         } else if ((cmd == CMD_SIGN || cmd == CMD_ADD) && !strcmp(*argv, "-addUnauthenticatedBlob")) {
             options->addBlob = 1;
         } else if ((cmd == CMD_SIGN || cmd == CMD_ATTACH) && !strcmp(*argv, "-nest")) {
             options->nest = 1;
+        } else if ((cmd == CMD_ADD || cmd == CMD_VERIFY) && !strcmp(*argv, "-index")) {
+            char *tmp_str;
+            if (--argc < 1 ) {
+                usage(argv0, "all");
+                return 0; /* FAILED */
+            }
+            options->index = (int)strtol(*(++argv), &tmp_str, 10);
+            if (tmp_str == *argv ||  *tmp_str != '\0' || errno == ERANGE) { /* not a number */
+                usage(argv0, "all");
+                return 0; /* FAILED */
+            }
         } else if ((cmd == CMD_VERIFY) && !strcmp(*argv, "-ignore-timestamp")) {
             options->ignore_timestamp = 1;
+        } else if ((cmd == CMD_VERIFY) && !strcmp(*argv, "-ignore-cdp")) {
+            options->ignore_cdp = 1;
         } else if ((cmd == CMD_SIGN || cmd == CMD_ADD || cmd == CMD_VERIFY) && !strcmp(*argv, "-verbose")) {
             options->verbose = 1;
-        } else if ((cmd == CMD_SIGN || cmd == CMD_ADD || cmd == CMD_ATTACH) && !strcmp(*argv, "-add-msi-dse")) {
+        } else if ((cmd == CMD_SIGN || cmd == CMD_EXTRACT_DATA || cmd == CMD_ADD || cmd == CMD_ATTACH)
+                && !strcmp(*argv, "-add-msi-dse")) {
             options->add_msi_dse = 1;
         } else if ((cmd == CMD_VERIFY) && (!strcmp(*argv, "-c") || !strcmp(*argv, "-catalog"))) {
             if (--argc < 1) {
@@ -3894,11 +4591,26 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
                 return 0; /* FAILED */
             }
             options->crlfile = OPENSSL_strdup(*++argv);
+        } else if ((cmd == CMD_SIGN || cmd == CMD_ADD || cmd == CMD_VERIFY)
+                && !strcmp(*argv, "-HTTPS-CAfile")) {
+            if (--argc < 1) {
+                usage(argv0, "all");
+                return 0; /* FAILED */
+            }
+            OPENSSL_free(options->https_cafile);
+            options->https_cafile = OPENSSL_strdup(*++argv);
+        } else if ((cmd == CMD_SIGN || cmd == CMD_ADD || cmd == CMD_VERIFY)
+                && !strcmp(*argv, "-HTTPS-CRLfile")) {
+            if (--argc < 1) {
+                usage(argv0, "all");
+                return 0; /* FAILED */
+            }
+            options->https_crlfile = OPENSSL_strdup(*++argv);
         } else if ((cmd == CMD_VERIFY || cmd == CMD_ATTACH) && (!strcmp(*argv, "-untrusted") || !strcmp(*argv, "-TSA-CAfile"))) {
             if (--argc < 1) {
                 usage(argv0, "all");
                 return 0; /* FAILED */
-      }
+            }
             OPENSSL_free(options->tsa_cafile);
             options->tsa_cafile = OPENSSL_strdup(*++argv);
         } else if ((cmd == CMD_VERIFY || cmd == CMD_ATTACH) && (!strcmp(*argv, "-CRLuntrusted") || !strcmp(*argv, "-TSA-CRLfile"))) {
@@ -3951,6 +4663,10 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
             help_for(argv0, "sign");
             cmd = CMD_HELP;
             return 0; /* FAILED */
+        } else if ((cmd == CMD_EXTRACT_DATA) && !strcmp(*argv, "--help")) {
+            help_for(argv0, "extract-data");
+            cmd = CMD_HELP;
+            return 0; /* FAILED */
         } else if ((cmd == CMD_VERIFY) && !strcmp(*argv, "--help")) {
             help_for(argv0, "verify");
             cmd = CMD_HELP;
@@ -3998,11 +4714,9 @@ static int main_configure(int argc, char **argv, GLOBAL_OPTIONS *options)
         return 0; /* FAILED */
     }
     if (argc > 0 ||
-#ifdef ENABLE_CURL
         (options->nturl && options->ntsurl) ||
         (options->nturl && options->tsa_certfile && options->tsa_keyfile) ||
         (options->ntsurl && options->tsa_certfile && options->tsa_keyfile) ||
-#endif
         !options->infile ||
         (cmd != CMD_VERIFY && !options->outfile) ||
         (cmd == CMD_SIGN && !((options->certfile && options->keyfile) ||
@@ -4033,7 +4747,7 @@ int main(int argc, char **argv)
 {
     FILE_FORMAT_CTX *ctx = NULL;
     GLOBAL_OPTIONS options;
-    PKCS7 *p7 = NULL;
+    PKCS7 *p7 = NULL, *cursig = NULL;
     BIO *outdata = NULL;
     BIO *hash = NULL;
     int ret = -1;
@@ -4050,9 +4764,13 @@ int main(int argc, char **argv)
 
     /* create some MS Authenticode OIDS we need later on */
     if (!OBJ_create(SPC_STATEMENT_TYPE_OBJID, NULL, NULL)
+        /* PKCS9_COUNTER_SIGNATURE exists as OpenSSL OBJ_pkcs9_countersignature */
         || !OBJ_create(MS_JAVA_SOMETHING, NULL, NULL)
         || !OBJ_create(SPC_SP_OPUS_INFO_OBJID, NULL, NULL)
-        || !OBJ_create(SPC_NESTED_SIGNATURE_OBJID, NULL, NULL))
+        || !OBJ_create(SPC_NESTED_SIGNATURE_OBJID, NULL, NULL)
+        || !OBJ_create(SPC_UNAUTHENTICATED_DATA_BLOB_OBJID, NULL, NULL)
+        || !OBJ_create(SPC_RFC3161_OBJID, NULL, NULL)
+        || !OBJ_create(PKCS9_SEQUENCE_NUMBER, NULL, NULL))
         DO_EXIT_0("Failed to create objects\n");
 
     /* commands and options initialization */
@@ -4081,7 +4799,9 @@ int main(int argc, char **argv)
             DO_EXIT_1("Failed to create file: %s\n", options.outfile);
         }
     }
-    ctx = file_format_msi.ctx_new(&options, hash, outdata);
+    ctx = file_format_script.ctx_new(&options, hash, outdata);
+    if (!ctx)
+        ctx = file_format_msi.ctx_new(&options, hash, outdata);
     if (!ctx)
         ctx = file_format_pe.ctx_new(&options, hash, outdata);
     if (!ctx)
@@ -4097,11 +4817,23 @@ int main(int argc, char **argv)
         }
         BIO_free_all(hash);
         BIO_free_all(outdata);
+        outdata = NULL;
         ret = 1; /* FAILED */
         DO_EXIT_0("Initialization error or unsupported input file type.\n");
     }
     if (options.cmd == CMD_VERIFY) {
         ret = verify_signed_file(ctx, &options);
+        goto skip_signing;
+    } else if (options.cmd == CMD_EXTRACT_DATA) {
+        if (!ctx->format->pkcs7_contents_get) {
+            DO_EXIT_0("Unsupported command: extract-data\n");
+        }
+        p7 = ctx->format->pkcs7_contents_get(ctx, hash, options.md);
+        if (!p7) {
+            DO_EXIT_0("Unable to extract pkcs7 contents\n");
+        }
+        ret = data_write_pkcs7(ctx, outdata, p7);
+        PKCS7_free(p7);
         goto skip_signing;
     } else if (options.cmd == CMD_EXTRACT) {
         if (!ctx->format->pkcs7_extract) {
@@ -4111,7 +4843,7 @@ int main(int argc, char **argv)
         if (!p7) {
             DO_EXIT_0("Unable to extract existing signature\n");
         }
-        ret = save_extracted_pkcs7(ctx, outdata, p7);
+        ret = data_write_pkcs7(ctx, outdata, p7);
         PKCS7_free(p7);
         goto skip_signing;
     } else if (options.cmd == CMD_REMOVE) {
@@ -4119,29 +4851,98 @@ int main(int argc, char **argv)
             DO_EXIT_0("Unsupported command: remove-signature\n");
         }
         ret = ctx->format->remove_pkcs7(ctx, hash, outdata);
+        if (ret) {
+            DO_EXIT_0("Unable to remove existing signature\n");
+        }
         if (ctx->format->update_data_size) {
             ctx->format->update_data_size(ctx, outdata, NULL);
         }
         goto skip_signing;
-    } else if (ctx->format->pkcs7_prepare) {
-        p7 = ctx->format->pkcs7_prepare(ctx, hash, outdata);
+    } else if (options.cmd == CMD_ADD) {
+        if (!ctx->format->pkcs7_extract) {
+            DO_EXIT_0("Unsupported command: add\n");
+        }
+        /* Obtain a current signature from previously-signed file */
+        p7 = ctx->format->pkcs7_extract(ctx);
         if (!p7) {
-            DO_EXIT_0("Unable to prepare new signature\n");
+            DO_EXIT_0("Unable to extract existing signature\n");
+        }
+        if (ctx->format->process_data) {
+            ctx->format->process_data(ctx, hash, outdata);
+        }
+    } else if (options.cmd == CMD_ATTACH) {
+        if (options.nest) {
+            if (!ctx->format->pkcs7_extract_to_nest) {
+                printf("Warning: Unsupported nesting (multiple signature)\n");
+            } else {
+                /* Obtain a current signature from previously-signed file */
+                cursig = ctx->format->pkcs7_extract_to_nest(ctx);
+                if (!cursig) {
+                    DO_EXIT_0("Unable to extract existing signature\n");
+                }
+                options.nested_number = nested_signatures_number_get(cursig);
+                if (options.nested_number < 0) {
+                    PKCS7_free(cursig);
+                    DO_EXIT_0("Unable to get number of nested signatures\n");
+                }
+            }
+        }
+        /* Obtain an existing PKCS#7 signature from a "sigin" file */
+        p7 = pkcs7_get_sigfile(ctx);
+        if (!p7) {
+            PKCS7_free(cursig);
+            DO_EXIT_0("Unable to extract valid signature\n");
+        }
+        if (ctx->format->process_data) {
+            ctx->format->process_data(ctx, hash, outdata);
+        }
+    } else if (options.cmd == CMD_SIGN) {
+        if (options.nest) {
+            if (!ctx->format->pkcs7_extract_to_nest) {
+                printf("Warning: Unsupported nesting (multiple signature)\n");
+            } else {
+                /* Obtain a current signature from previously-signed file */
+                cursig = ctx->format->pkcs7_extract_to_nest(ctx);
+                if (!cursig) {
+                    DO_EXIT_0("Unable to extract existing signature\n");
+                }
+                options.nested_number = nested_signatures_number_get(cursig);
+                if (options.nested_number < 0) {
+                    PKCS7_free(cursig);
+                    DO_EXIT_0("Unable to get number of nested signatures\n");
+                }
+            }
+        }
+        if (ctx->format->process_data) {
+            ctx->format->process_data(ctx, hash, outdata);
+        }
+        if (ctx->format->pkcs7_signature_new) {
+            /* Create a new PKCS#7 signature */
+            p7 = ctx->format->pkcs7_signature_new(ctx, hash);
+            if (!p7) {
+                DO_EXIT_0("Unable to prepare new signature\n");
+            }
         }
     } else {
         DO_EXIT_0("Unsupported command\n");
     }
-    ret = add_timestamp_and_blob(p7, ctx);
+    if (options.index > 0) {
+        /* CMD_ADD or CMD_VERIFY */
+        ret = add_nested_timestamp_and_blob(p7, ctx, options.index);
+    } else {
+        ret = add_timestamp_and_blob(p7, ctx);
+    }
     if (ret) {
         PKCS7_free(p7);
         DO_EXIT_0("Unable to set unauthenticated attributes\n");
     }
-    if (options.prevsig) {
-        if (!cursig_set_nested(options.prevsig, p7, ctx))
+    if (cursig) {
+        /* CMD_SIGN or CMD_ATTACH */
+        if (!cursig_set_nested(cursig, p7))
             DO_EXIT_0("Unable to append the nested signature to the current signature\n");
         PKCS7_free(p7);
-        p7 = options.prevsig;
-        options.prevsig = NULL;
+        p7 = cursig;
+        cursig = NULL;
     }
     if (ctx->format->append_pkcs7) {
         ret = ctx->format->append_pkcs7(ctx, outdata, p7);
@@ -4157,7 +4958,8 @@ int main(int argc, char **argv)
 
 skip_signing:
     if (ctx->format->bio_free) {
-        outdata = ctx->format->bio_free(hash, outdata);
+        ctx->format->bio_free(hash, outdata);
+        outdata = NULL;
     }
     if (!ret && options.cmd == CMD_ATTACH) {
         ret = check_attached_data(&options);
@@ -4171,12 +4973,28 @@ skip_signing:
     }
 
 err_cleanup:
-    if (outdata && options.outfile) {
-        /* unlink outfile */
-        remove_file(options.outfile);
+    if (outdata) {
+        BIO *head = hash;
+        int outdata_in_hash = 0;
+
+        while (head) {
+            BIO *tail = BIO_pop(head);
+
+            if (head == outdata)
+                outdata_in_hash = 1;
+            BIO_free(head);
+            head = tail;
+        }
+        if (!outdata_in_hash)
+            BIO_free_all(outdata);
+
+        if (options.outfile) {
+            /* unlink outfile */
+            remove_file(options.outfile);
+        }
     }
     if (ctx && ctx->format->ctx_cleanup) {
-        ctx->format->ctx_cleanup(ctx, hash, outdata);
+        ctx->format->ctx_cleanup(ctx);
     }
 #if OPENSSL_VERSION_NUMBER>=0x30000000L
     providers_cleanup();

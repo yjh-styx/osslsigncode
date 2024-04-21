@@ -43,32 +43,38 @@ struct cab_ctx_st {
 /* FILE_FORMAT method prototypes */
 static FILE_FORMAT_CTX *cab_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *outdata);
 static ASN1_OBJECT *cab_obsolete_link_get(u_char **p, int *plen, FILE_FORMAT_CTX *ctx);
+static PKCS7 *cab_pkcs7_contents_get(FILE_FORMAT_CTX *ctx, BIO *hash, const EVP_MD *md);
 static int cab_hash_length_get(FILE_FORMAT_CTX *ctx);
-static int cab_check_file(FILE_FORMAT_CTX *ctx, int detached);
 static u_char *cab_digest_calc(FILE_FORMAT_CTX *ctx, const EVP_MD *md);
 static int cab_verify_digests(FILE_FORMAT_CTX *ctx, PKCS7 *p7);
 static PKCS7 *cab_pkcs7_extract(FILE_FORMAT_CTX *ctx);
+static PKCS7 *cab_pkcs7_extract_to_nest(FILE_FORMAT_CTX *ctx);
 static int cab_remove_pkcs7(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
-static PKCS7 *cab_pkcs7_prepare(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+static int cab_process_data(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+static PKCS7 *cab_pkcs7_signature_new(FILE_FORMAT_CTX *ctx, BIO *hash);
 static int cab_append_pkcs7(FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7);
 static void cab_update_data_size(FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7);
-static BIO *cab_bio_free(BIO *hash, BIO *outdata);
-static void cab_ctx_cleanup(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+static void cab_bio_free(BIO *hash, BIO *outdata);
+static void cab_ctx_cleanup(FILE_FORMAT_CTX *ctx);
+static int cab_is_detaching_supported(void);
 
 FILE_FORMAT file_format_cab = {
     .ctx_new = cab_ctx_new,
     .data_blob_get = cab_obsolete_link_get,
+    .pkcs7_contents_get = cab_pkcs7_contents_get,
     .hash_length_get = cab_hash_length_get,
-    .check_file = cab_check_file,
     .digest_calc = cab_digest_calc,
     .verify_digests = cab_verify_digests,
     .pkcs7_extract = cab_pkcs7_extract,
+    .pkcs7_extract_to_nest = cab_pkcs7_extract_to_nest,
     .remove_pkcs7 = cab_remove_pkcs7,
-    .pkcs7_prepare = cab_pkcs7_prepare,
+    .process_data = cab_process_data,
+    .pkcs7_signature_new = cab_pkcs7_signature_new,
     .append_pkcs7 = cab_append_pkcs7,
     .update_data_size = cab_update_data_size,
     .bio_free = cab_bio_free,
-    .ctx_cleanup = cab_ctx_cleanup
+    .ctx_cleanup = cab_ctx_cleanup,
+    .is_detaching_supported = cab_is_detaching_supported
 };
 
 /* Prototypes */
@@ -77,6 +83,7 @@ static int cab_add_jp_attribute(PKCS7 *p7, int jp);
 static size_t cab_write_optional_names(BIO *outdata, char *indata, size_t len, uint16_t flags);
 static int cab_modify_header(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
 static int cab_add_header(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata);
+static int cab_check_file(FILE_FORMAT_CTX *ctx);
 
 /*
  * FILE_FORMAT method definitions
@@ -104,12 +111,12 @@ static FILE_FORMAT_CTX *cab_ctx_new(GLOBAL_OPTIONS *options, BIO *hash, BIO *out
         return NULL; /* FAILED */
     }
     if (memcmp(options->indata, "MSCF", 4)) {
-        unmap_file(options->infile, filesize);
+        unmap_file(options->indata, filesize);
         return NULL; /* FAILED */
     }
     cab_ctx = cab_ctx_get(options->indata, filesize);
     if (!cab_ctx) {
-        unmap_file(options->infile, filesize);
+        unmap_file(options->indata, filesize);
         return NULL; /* FAILED */
     }
     ctx = OPENSSL_malloc(sizeof(FILE_FORMAT_CTX));
@@ -152,40 +159,38 @@ static ASN1_OBJECT *cab_obsolete_link_get(u_char **p, int *plen, FILE_FORMAT_CTX
 }
 
 /*
+ * Allocate and return a data content to be signed.
+ * [in] ctx: structure holds input and output data
+ * [in] hash: message digest BIO
+ * [in] md: message digest algorithm
+ * [returns] data content
+ */
+static PKCS7 *cab_pkcs7_contents_get(FILE_FORMAT_CTX *ctx, BIO *hash, const EVP_MD *md)
+{
+    ASN1_OCTET_STRING *content;
+
+    /* squash the unused parameter warning, use initialized message digest BIO */
+    (void)md;
+
+    /* Strip current signature and modify header */
+    if (ctx->cab_ctx->header_size == 20) {
+        if (!cab_modify_header(ctx, hash, NULL))
+            return NULL; /* FAILED */
+    } else {
+        if (!cab_add_header(ctx, hash, NULL))
+            return NULL; /* FAILED */
+    }
+    content = spc_indirect_data_content_get(hash, ctx);
+    return pkcs7_set_content(content);
+}
+
+/*
  * [in] ctx: structure holds input and output data
  * [returns] the size of the message digest when passed an EVP_MD structure (the size of the hash)
  */
 static int cab_hash_length_get(FILE_FORMAT_CTX *ctx)
 {
     return EVP_MD_size(ctx->options->md);
-}
-
-/*
- * Check if the signature exists.
- * [in, out] ctx: structure holds input and output data
- * [in] detached: embedded/detached PKCS#7 signature switch
- * [returns] 0 on error or 1 on success
- */
-static int cab_check_file(FILE_FORMAT_CTX *ctx, int detached)
-{
-    if (!ctx) {
-        printf("Init error\n\n");
-        return 0; /* FAILED */
-    }
-    if (detached) {
-        printf("Checking the specified catalog file\n\n");
-        return 1; /* OK */
-    }
-    if (ctx->cab_ctx->header_size != 20) {
-        printf("No signature found\n\n");
-        return 0; /* FAILED */
-    }
-    if (ctx->cab_ctx->sigpos == 0 || ctx->cab_ctx->siglen == 0
-        || ctx->cab_ctx->sigpos > ctx->cab_ctx->fileend) {
-        printf("No signature found\n\n");
-        return 0; /* FAILED */
-    }
-    return 1; /* OK */
 }
 
 /*
@@ -363,11 +368,23 @@ static int cab_verify_digests(FILE_FORMAT_CTX *ctx, PKCS7 *p7)
  */
 static PKCS7 *cab_pkcs7_extract(FILE_FORMAT_CTX *ctx)
 {
-    if (ctx->cab_ctx->sigpos == 0 || ctx->cab_ctx->siglen == 0
-        || ctx->cab_ctx->sigpos > ctx->cab_ctx->fileend) {
+    const u_char *blob;
+
+    if (!cab_check_file(ctx)) {
         return NULL; /* FAILED */
     }
-    return pkcs7_get(ctx->options->indata, ctx->cab_ctx->sigpos, ctx->cab_ctx->siglen);
+    blob = (u_char *)ctx->options->indata + ctx->cab_ctx->sigpos;
+    return d2i_PKCS7(NULL, &blob, ctx->cab_ctx->siglen);
+}
+
+/*
+ * Extract existing signature in DER format.
+ * [in] ctx: structure holds input and output data
+ * pointer to PKCS#7 structure
+ */
+static PKCS7 *cab_pkcs7_extract_to_nest(FILE_FORMAT_CTX *ctx)
+{
+    return cab_pkcs7_extract(ctx);
 }
 
 /*
@@ -382,11 +399,15 @@ static int cab_remove_pkcs7(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
     size_t i, written, len;
     uint32_t tmp;
     uint16_t nfolders, flags;
-    char *buf = OPENSSL_malloc(SIZE_64K);
+    char *buf;
 
     /* squash the unused parameter warning */
     (void)hash;
 
+    if (!cab_check_file(ctx)) {
+        return 1; /* FAILED, no signature */
+    }
+    buf = OPENSSL_malloc(SIZE_64K);
     /*
      * u1 signature[4] 4643534D MSCF: 0-3
      * u4 reserved1 00000000: 4-7
@@ -448,68 +469,62 @@ static int cab_remove_pkcs7(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
 }
 
 /*
- * Obtain an existing signature or create a new one.
+ * Modify specific type data and calculate a hash (message digest) of data.
  * [in, out] ctx: structure holds input and output data
  * [out] hash: message digest BIO
  * [out] outdata: outdata file BIO
- * [returns] pointer to PKCS#7 structure
+ * [returns] 1 on error or 0 on success
  */
-static PKCS7 *cab_pkcs7_prepare(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
+static int cab_process_data(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
 {
-    PKCS7 *cursig = NULL, *p7 = NULL;
-
     /* Strip current signature and modify header */
     if (ctx->cab_ctx->header_size == 20) {
         if (!cab_modify_header(ctx, hash, outdata))
-            return NULL; /* FAILED */
+            return 1; /* FAILED */
     } else {
         if (!cab_add_header(ctx, hash, outdata))
-            return NULL; /* FAILED */
+            return 1; /* FAILED */
     }
-    /* Obtain a current signature from previously-signed file */
-    if ((ctx->options->cmd == CMD_SIGN && ctx->options->nest)
-        || (ctx->options->cmd == CMD_ATTACH && ctx->options->nest)
-        || ctx->options->cmd == CMD_ADD) {
-        cursig = pkcs7_get(ctx->options->indata, ctx->cab_ctx->sigpos, ctx->cab_ctx->siglen);
-        if (!cursig) {
-            printf("Unable to extract existing signature\n");
-            return NULL; /* FAILED */
-        }
-        if (ctx->options->cmd == CMD_ADD)
-            p7 = cursig;
+    return 0; /* OK */
+}
+
+/*
+ * Create a new PKCS#7 signature.
+ * [in, out] ctx: structure holds input and output data
+ * [out] hash: message digest BIO
+ * [returns] pointer to PKCS#7 structure
+ */
+static PKCS7 *cab_pkcs7_signature_new(FILE_FORMAT_CTX *ctx, BIO *hash)
+{
+    ASN1_OCTET_STRING *content;
+    PKCS7 *p7 = pkcs7_create(ctx);
+
+    if (!p7) {
+        printf("Creating a new signature failed\n");
+        return NULL; /* FAILED */
     }
-    if (ctx->options->cmd == CMD_ATTACH) {
-        /* Obtain an existing PKCS#7 signature */
-        p7 = pkcs7_get_sigfile(ctx);
-        if (!p7) {
-            printf("Unable to extract valid signature\n");
-            PKCS7_free(cursig);
-            return NULL; /* FAILED */
-        }
-    } else if (ctx->options->cmd == CMD_SIGN) {
-        /* Create a new PKCS#7 signature */
-        p7 = pkcs7_create(ctx);
-        if (!p7) {
-            printf("Creating a new signature failed\n");
-            return NULL; /* FAILED */
-        }
-        if (ctx->options->jp >= 0 && !cab_add_jp_attribute(p7, ctx->options->jp)) {
-            printf("Adding jp attribute failed\n");
-            PKCS7_free(p7);
-            return NULL; /* FAILED */
-        }
-        if (!add_indirect_data_object(p7)) {
-            printf("Adding SPC_INDIRECT_DATA_OBJID failed\n");
-            PKCS7_free(p7);
-            return NULL; /* FAILED */
-        }
-        if (!sign_spc_indirect_data_content(p7, hash, ctx)) {
-            printf("Failed to set signed content\n");
-            return NULL; /* FAILED */
-        }
+    if (ctx->options->jp >= 0 && !cab_add_jp_attribute(p7, ctx->options->jp)) {
+        printf("Adding jp attribute failed\n");
+        PKCS7_free(p7);
+        return NULL; /* FAILED */
     }
-    if (ctx->options->nest)
-        ctx->options->prevsig = cursig;
+    if (!add_indirect_data_object(p7)) {
+        printf("Adding SPC_INDIRECT_DATA_OBJID failed\n");
+        PKCS7_free(p7);
+        return NULL; /* FAILED */
+    }
+    content = spc_indirect_data_content_get(hash, ctx);
+    if (!content) {
+        printf("Failed to get spcIndirectDataContent\n");
+        return NULL; /* FAILED */
+    }
+    if (!sign_spc_indirect_data_content(p7, content)) {
+        printf("Failed to set signed content\n");
+        PKCS7_free(p7);
+        ASN1_OCTET_STRING_free(content);
+        return NULL; /* FAILED */
+    }
+    ASN1_OCTET_STRING_free(content);
     return p7;
 }
 
@@ -584,13 +599,11 @@ static void cab_update_data_size(FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7)
  * [out] outdata: outdata file BIO (unused)
  * [returns] none
  */
-static BIO *cab_bio_free(BIO *hash, BIO *outdata)
+static void cab_bio_free(BIO *hash, BIO *outdata)
 {
     /* squash the unused parameter warning */
     (void)outdata;
-
     BIO_free_all(hash);
-    return NULL;
 }
 
 /*
@@ -601,14 +614,16 @@ static BIO *cab_bio_free(BIO *hash, BIO *outdata)
  * [in] outdata: outdata file BIO
  * [returns] none
  */
-static void cab_ctx_cleanup(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
+static void cab_ctx_cleanup(FILE_FORMAT_CTX *ctx)
 {
-    if (outdata) {
-        BIO_free_all(hash);
-    }
     unmap_file(ctx->options->indata, ctx->cab_ctx->fileend);
     OPENSSL_free(ctx->cab_ctx);
     OPENSSL_free(ctx);
+}
+
+static int cab_is_detaching_supported(void)
+{
+    return 1; /* OK */
 }
 
 /*
@@ -924,6 +939,29 @@ static int cab_add_header(FILE_FORMAT_CTX *ctx, BIO *hash, BIO *outdata)
             return 0; /* FAILED */
         len -= written;
         i += written;
+    }
+    return 1; /* OK */
+}
+
+/*
+ * Check if the signature exists.
+ * [in, out] ctx: structure holds input and output data
+ * [returns] 0 on error or 1 on success
+ */
+static int cab_check_file(FILE_FORMAT_CTX *ctx)
+{
+    if (!ctx) {
+        printf("Init error\n\n");
+        return 0; /* FAILED */
+    }
+    if (ctx->cab_ctx->header_size != 20) {
+        printf("No signature found\n\n");
+        return 0; /* FAILED */
+    }
+    if (ctx->cab_ctx->sigpos == 0 || ctx->cab_ctx->siglen == 0
+        || ctx->cab_ctx->sigpos > ctx->cab_ctx->fileend) {
+        printf("No signature found\n\n");
+        return 0; /* FAILED */
     }
     return 1; /* OK */
 }

@@ -10,9 +10,11 @@
 
 /* Prototypes */
 static SpcSpOpusInfo *spc_sp_opus_info_create(FILE_FORMAT_CTX *ctx);
-static int spc_indirect_data_content_get(u_char **blob, int *len, FILE_FORMAT_CTX *ctx);
+static int spc_indirect_data_content_create(u_char **blob, int *len, FILE_FORMAT_CTX *ctx);
 static int pkcs7_signer_info_add_spc_sp_opus_info(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx);
+static int pkcs7_signer_info_add_signing_time(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx);
 static int pkcs7_signer_info_add_purpose(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx);
+static int pkcs7_signer_info_add_sequence_number(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx);
 static STACK_OF(X509) *X509_chain_get_sorted(FILE_FORMAT_CTX *ctx, int signer);
 static int X509_compare(const X509 *const *a, const X509 *const *b);
 
@@ -109,57 +111,50 @@ void unmap_file(char *indata, const size_t size)
 }
 
 /*
- * Add a custom, non-trusted time to the PKCS7 structure to prevent OpenSSL
- * adding the _current_ time. This allows to create a deterministic signature
- * when no trusted timestamp server was specified, making osslsigncode
- * behaviour closer to signtool.exe (which doesn't include any non-trusted
- * time in this case.)
- * [in, out] si: PKCS7_SIGNER_INFO structure
- * [in] ctx: structure holds input and output data
- * [returns] 0 on error or 1 on success
- */
-int pkcs7_signer_info_add_signing_time(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx)
-{
-    if (ctx->options->time == INVALID_TIME) /* -time option was not specified */
-        return 1; /* SUCCESS */
-    return PKCS7_add_signed_attribute(si, NID_pkcs9_signingTime, V_ASN1_UTCTIME,
-        ASN1_TIME_adj(NULL, ctx->options->time, 0, 0));
-}
-
-/*
- * Retrieve a decoded PKCS#7 structure corresponding to the signature
- * stored in the "sigin" file
- * CMD_ATTACH command specific
- * [in] ctx: structure holds input and output data
+ * Retrieve a decoded PKCS#7 structure
+ * [in] data: encoded PEM or DER data
+ * [in] size: data size
  * [returns] pointer to PKCS#7 structure
  */
-PKCS7 *pkcs7_get_sigfile(FILE_FORMAT_CTX *ctx)
+PKCS7 *pkcs7_read_data(char *data, uint32_t size)
 {
     PKCS7 *p7 = NULL;
-    uint32_t filesize;
-    char *indata;
     BIO *bio;
     const char pemhdr[] = "-----BEGIN PKCS7-----";
 
-    filesize = get_file_size(ctx->options->sigfile);
-    if (!filesize) {
-        return NULL; /* FAILED */
-    }
-    indata = map_file(ctx->options->sigfile, filesize);
-    if (!indata) {
-        printf("Failed to open file: %s\n", ctx->options->sigfile);
-        return NULL; /* FAILED */
-    }
-    bio = BIO_new_mem_buf(indata, (int)filesize);
-    if (filesize >= sizeof pemhdr && !memcmp(indata, pemhdr, sizeof pemhdr - 1)) {
+    bio = BIO_new_mem_buf(data, (int)size);
+    if (size >= sizeof pemhdr && !memcmp(data, pemhdr, sizeof pemhdr - 1)) {
         /* PEM format */
         p7 = PEM_read_bio_PKCS7(bio, NULL, NULL, NULL);
     } else { /* DER format */
         p7 = d2i_PKCS7_bio(bio, NULL);
     }
     BIO_free_all(bio);
-    unmap_file(indata, filesize);
     return p7;
+}
+
+/*
+ * [in, out] ctx: structure holds input and output data
+ * [out] outdata: BIO outdata file
+ * [in] p7: PKCS#7 signature
+ * [returns] 1 on error or 0 on success
+ */
+int data_write_pkcs7(FILE_FORMAT_CTX *ctx, BIO *outdata, PKCS7 *p7)
+{
+    int ret;
+
+    (void)BIO_reset(outdata);
+    if (ctx->options->output_pkcs7) {
+        /* PEM format */
+        ret = !PEM_write_bio_PKCS7(outdata, p7);
+    } else {
+        /* default DER format */
+        ret = !i2d_PKCS7_bio(outdata, p7);
+    }
+    if (ret) {
+        printf("Unable to write pkcs7 object\n");
+    }
+    return ret;
 }
 
 /*
@@ -205,13 +200,19 @@ PKCS7 *pkcs7_create(FILE_FORMAT_CTX *ctx)
             return NULL; /* FAILED */
         }
     }
-    pkcs7_signer_info_add_signing_time(si, ctx);
+    if (!pkcs7_signer_info_add_signing_time(si, ctx)) {
+        return NULL; /* FAILED */
+    }
     if (!pkcs7_signer_info_add_purpose(si, ctx)) {
         return NULL; /* FAILED */
     }
     if ((ctx->options->desc || ctx->options->url) &&
             !pkcs7_signer_info_add_spc_sp_opus_info(si, ctx)) {
         printf("Couldn't allocate memory for opus info\n");
+        return NULL; /* FAILED */
+    }
+    if ((ctx->options->nested_number >= 0) &&
+            !pkcs7_signer_info_add_sequence_number(si, ctx)) {
         return NULL; /* FAILED */
     }
     /* create X509 chain sorted in ascending order by their DER encoding */
@@ -262,47 +263,33 @@ int add_indirect_data_object(PKCS7 *p7)
  * The spcIndirectDataContent structure is used in Authenticode signatures
  * to store the digest and other attributes of the signed file.
  * [in, out] p7: new PKCS#7 signature
- * [in] hash: message digest BIO
- * [in] ctx: structure holds input and output data
+ * [in] content: spcIndirectDataContent
  * [returns] 0 on error or 1 on success
  */
-int sign_spc_indirect_data_content(PKCS7 *p7, BIO *hash, FILE_FORMAT_CTX *ctx)
+int sign_spc_indirect_data_content(PKCS7 *p7, ASN1_OCTET_STRING *content)
 {
-    u_char mdbuf[5 * EVP_MAX_MD_SIZE + 24];
-    int mdlen, seqhdrlen, hashlen;
+    int len, inf, tag, class;
+    long plen;
+    const u_char *data, *p;
     PKCS7 *td7;
-    u_char *p = NULL;
-    int len = 0;
-    u_char *buf;
 
-    hashlen = ctx->format->hash_length_get(ctx);
-    if (hashlen > EVP_MAX_MD_SIZE) {
-        /* APPX format specific */
-        mdlen = BIO_read(hash, (char*)mdbuf, hashlen);
-    } else {
-        mdlen = BIO_gets(hash, (char*)mdbuf, EVP_MAX_MD_SIZE);
-    }
-    if (!spc_indirect_data_content_get(&p, &len, ctx))
-        return 0; /* FAILED */
-
-    buf = OPENSSL_malloc(SIZE_64K);
-    memcpy(buf, p, (size_t)len);
-    OPENSSL_free(p);
-    memcpy(buf + len, mdbuf, (size_t)mdlen);
-    seqhdrlen = asn1_simple_hdr_len(buf, len);
-
-    if (!pkcs7_sign_content(p7, buf + seqhdrlen, len - seqhdrlen + mdlen)) {
-        printf("Failed to sign content\n");
-        OPENSSL_free(buf);
+    p = data = ASN1_STRING_get0_data(content);
+    len = ASN1_STRING_length(content);
+    inf = ASN1_get_object(&p, &plen, &tag, &class, len);
+    if (inf != V_ASN1_CONSTRUCTED || tag != V_ASN1_SEQUENCE
+        || !pkcs7_sign_content(p7, p, (int)plen)) {
+        printf("Failed to sign spcIndirectDataContent\n");
         return 0; /* FAILED */
     }
     td7 = PKCS7_new();
+    if (!td7) {
+        return 0; /* FAILED */
+    }
     td7->type = OBJ_txt2obj(SPC_INDIRECT_DATA_OBJID, 1);
     td7->d.other = ASN1_TYPE_new();
     td7->d.other->type = V_ASN1_SEQUENCE;
     td7->d.other->value.sequence = ASN1_STRING_new();
-    ASN1_STRING_set(td7->d.other->value.sequence, buf, len + mdlen);
-    OPENSSL_free(buf);
+    ASN1_STRING_set(td7->d.other->value.sequence, data, len);
     if (!PKCS7_set_content(p7, td7)) {
         printf("PKCS7_set_content failed\n");
         PKCS7_free(td7);
@@ -312,12 +299,91 @@ int sign_spc_indirect_data_content(PKCS7 *p7, BIO *hash, FILE_FORMAT_CTX *ctx)
 }
 
 /*
+ * Add encapsulated content to signed PKCS7 structure.
+ * [in] content: spcIndirectDataContent
+ * [returns] new PKCS#7 signature with encapsulated content
+ */
+PKCS7 *pkcs7_set_content(ASN1_OCTET_STRING *content)
+{
+    PKCS7 *p7, *td7;
+
+    p7 = PKCS7_new();
+    if (!p7) {
+        return NULL; /* FAILED */
+    }
+    if (!PKCS7_set_type(p7, NID_pkcs7_signed)) {
+        PKCS7_free(p7);
+        return NULL; /* FAILED */
+    }
+    if (!PKCS7_content_new(p7, NID_pkcs7_data)) {
+        PKCS7_free(p7);
+        return NULL; /* FAILED */
+    }
+    td7 = PKCS7_new();
+    if (!td7) {
+        PKCS7_free(p7);
+        return NULL; /* FAILED */
+    }
+    td7->type = OBJ_txt2obj(SPC_INDIRECT_DATA_OBJID, 1);
+    td7->d.other = ASN1_TYPE_new();
+    td7->d.other->type = V_ASN1_SEQUENCE;
+    td7->d.other->value.sequence = content;
+    if (!PKCS7_set_content(p7, td7)) {
+        PKCS7_free(td7);
+        PKCS7_free(p7);
+        return NULL; /* FAILED */
+    }
+    return p7;
+}
+
+/*
+ * Return spcIndirectDataContent.
+ * [in] hash: message digest BIO
+ * [in] ctx: structure holds input and output data
+ * [returns] content
+ */
+ASN1_OCTET_STRING *spc_indirect_data_content_get(BIO *hash, FILE_FORMAT_CTX *ctx)
+{
+    ASN1_OCTET_STRING *content;
+    u_char mdbuf[5 * EVP_MAX_MD_SIZE + 24];
+    int mdlen, hashlen, len = 0;
+    u_char *data, *p = NULL;
+
+    content = ASN1_OCTET_STRING_new();
+    if (!content) {
+        return NULL; /* FAILED */
+    }
+    if (!spc_indirect_data_content_create(&p, &len, ctx)) {
+        ASN1_OCTET_STRING_free(content);
+        return NULL; /* FAILED */
+    }
+    hashlen = ctx->format->hash_length_get(ctx);
+    if (hashlen > EVP_MAX_MD_SIZE) {
+        /* APPX format specific */
+        mdlen = BIO_read(hash, (char*)mdbuf, hashlen);
+    } else {
+        mdlen = BIO_gets(hash, (char*)mdbuf, EVP_MAX_MD_SIZE);
+    }
+    data = OPENSSL_malloc((size_t)(len + mdlen));
+    memcpy(data, p, (size_t)len);
+    OPENSSL_free(p);
+    memcpy(data + len, mdbuf, (size_t)mdlen);
+    if (!ASN1_OCTET_STRING_set(content, data, len + mdlen)) {
+        ASN1_OCTET_STRING_free(content);
+        OPENSSL_free(data);
+        return NULL; /* FAILED */
+    }
+    OPENSSL_free(data);
+    return content;
+}
+
+/*
  * Signs the data and place the signature in p7
  * [in, out] p7: new PKCS#7 signature
  * [in] data: content data
  * [in] len: content length
  */
-int pkcs7_sign_content(PKCS7 *p7, u_char *data, int len)
+int pkcs7_sign_content(PKCS7 *p7, const u_char *data, int len)
 {
     BIO *p7bio;
 
@@ -329,6 +395,7 @@ int pkcs7_sign_content(PKCS7 *p7, u_char *data, int len)
     (void)BIO_flush(p7bio);
     if (!PKCS7_dataFinal(p7, p7bio)) {
         printf("PKCS7_dataFinal failed\n");
+        BIO_free_all(p7bio);
         return 0; /* FAILED */
     }
     BIO_free_all(p7bio);
@@ -412,6 +479,45 @@ int is_content_type(PKCS7 *p7, const char *objid)
 }
 
 /*
+ * [in] p7: new PKCS#7 signature
+ * [returns] pointer to MsCtlContent structure
+ */
+MsCtlContent *ms_ctl_content_get(PKCS7 *p7)
+{
+    ASN1_STRING *value;
+    const u_char *data;
+
+    if (!is_content_type(p7, MS_CTL_OBJID)) {
+        printf("Failed to find MS_CTL_OBJID\n");
+        return NULL; /* FAILED */
+    }
+    value = p7->d.sign->contents->d.other->value.sequence;
+    data = ASN1_STRING_get0_data(value);
+    return d2i_MsCtlContent(NULL, &data, ASN1_STRING_length(value));
+}
+
+/*
+ * [in] attribute: catalog attribute
+ * [returns] catalog content
+ */
+ASN1_TYPE *catalog_content_get(CatalogAuthAttr *attribute)
+{
+    ASN1_STRING *value;
+    STACK_OF(ASN1_TYPE) *contents;
+    ASN1_TYPE *content;
+    const u_char *contents_data;
+
+    value = attribute->contents->value.sequence;
+    contents_data = ASN1_STRING_get0_data(value);
+    contents = d2i_ASN1_SET_ANY(NULL, &contents_data, ASN1_STRING_length(value));
+    if (!contents)
+        return 0; /* FAILED */
+    content = sk_ASN1_TYPE_value(contents, 0);
+    sk_ASN1_TYPE_free(contents);
+    return content;
+}
+
+/*
  * PE and CAB format specific
  * [in] none
  * [returns] pointer to SpcLink
@@ -431,23 +537,6 @@ SpcLink *spc_link_obsolete_get(void)
     link->value.file->value.unicode = ASN1_BMPSTRING_new();
     ASN1_STRING_set(link->value.file->value.unicode, obsolete, sizeof obsolete);
     return link;
-}
-
-/*
- * Retrieve a decoded PKCS#7 structure
- * [in] indata: mapped file
- * [in] sigpos: signature data offset
- * [in] siglen: signature data size
- * [returns] pointer to PKCS#7 structure
- */
-PKCS7 *pkcs7_get(char *indata, uint32_t sigpos, uint32_t siglen)
-{
-    PKCS7 *p7 = NULL;
-    const u_char *blob;
-
-    blob = (u_char *)indata + sigpos;
-    p7 = d2i_PKCS7(NULL, &blob, siglen);
-    return p7;
 }
 
 /*
@@ -500,14 +589,22 @@ static SpcSpOpusInfo *spc_sp_opus_info_create(FILE_FORMAT_CTX *ctx)
  * [in] ctx: FILE_FORMAT_CTX structure
  * [returns] 0 on error or 1 on success
  */
-static int spc_indirect_data_content_get(u_char **blob, int *len, FILE_FORMAT_CTX *ctx)
+static int spc_indirect_data_content_create(u_char **blob, int *len, FILE_FORMAT_CTX *ctx)
 {
     u_char *p = NULL;
-    int hashlen, l = 0;
-    int mdtype = EVP_MD_nid(ctx->options->md);
+    int mdtype, hashlen, l = 0;
     void *hash;
     SpcIndirectDataContent *idc = SpcIndirectDataContent_new();
 
+    if (!ctx->format->data_blob_get || !ctx->format->hash_length_get) {
+        return 0; /* FAILED */
+    }
+    if (ctx->format->md_get) {
+        /* APPX file specific - use a hash algorithm specified in the AppxBlockMap.xml file */
+        mdtype = EVP_MD_nid(ctx->format->md_get(ctx));
+    } else {
+        mdtype = EVP_MD_nid(ctx->options->md);
+    }
     idc->data->value = ASN1_TYPE_new();
     idc->data->value->type = V_ASN1_SEQUENCE;
     idc->data->value->value.sequence = ASN1_STRING_new();
@@ -561,6 +658,24 @@ static int pkcs7_signer_info_add_spc_sp_opus_info(PKCS7_SIGNER_INFO *si, FILE_FO
 }
 
 /*
+ * Add a custom, non-trusted time to the PKCS7 structure to prevent OpenSSL
+ * adding the _current_ time. This allows to create a deterministic signature
+ * when no trusted timestamp server was specified, making osslsigncode
+ * behaviour closer to signtool.exe (which doesn't include any non-trusted
+ * time in this case.)
+ * [in, out] si: PKCS7_SIGNER_INFO structure
+ * [in] ctx: structure holds input and output data
+ * [returns] 0 on error or 1 on success
+ */
+static int pkcs7_signer_info_add_signing_time(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx)
+{
+    if (ctx->options->time == INVALID_TIME) /* -time option was not specified */
+        return 1; /* SUCCESS */
+    return PKCS7_add_signed_attribute(si, NID_pkcs9_signingTime, V_ASN1_UTCTIME,
+        ASN1_TIME_adj(NULL, ctx->options->time, 0, 0));
+}
+
+/*
  * [in, out] si: PKCS7_SIGNER_INFO structure
  * [in] ctx: structure holds input and output data
  * [returns] 0 on error or 1 on success
@@ -584,6 +699,25 @@ static int pkcs7_signer_info_add_purpose(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX 
     }
     return PKCS7_add_signed_attribute(si, OBJ_txt2nid(SPC_STATEMENT_TYPE_OBJID),
             V_ASN1_SEQUENCE, purpose);
+}
+
+/*
+ * [in, out] si: PKCS7_SIGNER_INFO structure
+ * [in] ctx: structure holds input and output data
+ * [returns] 0 on error or 1 on success
+ */
+static int pkcs7_signer_info_add_sequence_number(PKCS7_SIGNER_INFO *si, FILE_FORMAT_CTX *ctx)
+{
+    ASN1_INTEGER *number = ASN1_INTEGER_new();
+
+    if (!number)
+        return 0; /* FAILED */
+    if (!ASN1_INTEGER_set(number, ctx->options->nested_number + 1)) {
+        ASN1_INTEGER_free(number);
+        return 0; /* FAILED */
+    }
+    return PKCS7_add_signed_attribute(si, OBJ_txt2nid(PKCS9_SEQUENCE_NUMBER),
+            V_ASN1_INTEGER, number);
 }
 
 /*
